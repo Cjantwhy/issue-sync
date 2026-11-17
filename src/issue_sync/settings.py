@@ -7,7 +7,7 @@ the `jira-check` command) do not require the rest.
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, Literal
 
 from pydantic import AfterValidator, AnyHttpUrl, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -44,6 +44,22 @@ class GoogleSettings(_EnvSettings):
     )
 
 
+class LlmSettings(_EnvSettings):
+    """Any OpenAI-compatible chat completions API (DeepSeek, OpenAI, OpenRouter, ...)."""
+
+    llm_base_url: BaseUrl = Field(description="e.g. https://api.deepseek.com")
+    llm_model: str = Field(min_length=1, description="e.g. deepseek-flash")
+    llm_api_key: SecretStr = Field(min_length=1)
+    # json_schema lets the API enforce the schema; json_object is supported more widely.
+    llm_response_format: Literal["json_object", "json_schema"] = "json_object"
+    # Provider-specific request fields, as JSON, e.g. {"thinking": {"type": "disabled"}}.
+    llm_extra_body: dict[str, Any] = Field(default_factory=dict)
+    llm_timeout_seconds: float = Field(default=60.0, gt=0)
+    # Classification attempts before a ticket is created without an AI judgement.
+    llm_max_attempts: int = Field(default=3, ge=1)
+    classifier_config_path: Path = Path("config/classifier.yaml")
+
+
 def _valid_poll_interval(seconds: int) -> int:
     # arq cron schedules by second/minute sets, so the interval must divide a minute or an hour.
     if (seconds < 60 and 60 % seconds == 0) or (seconds % 60 == 0 and 60 % (seconds // 60) == 0):
@@ -51,7 +67,7 @@ def _valid_poll_interval(seconds: int) -> int:
     raise ValueError("must divide 60 seconds (e.g. 15, 30) or 60 minutes (e.g. 60, 300, 600)")
 
 
-class Settings(DatabaseSettings, JiraSettings, GoogleSettings):
+class Settings(DatabaseSettings, JiraSettings, GoogleSettings, LlmSettings):
     redis_url: str = Field(description="Redis URL used by arq, e.g. redis://redis:6379/0")
     slack_config_path: Path = Path("config/slack.yaml")
     log_level: str = "INFO"

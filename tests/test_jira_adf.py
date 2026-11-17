@@ -1,6 +1,6 @@
 import pytest
 
-from issue_sync.tickets.base import TicketContent
+from issue_sync.tickets.base import TicketContent, TriageNote
 from issue_sync.tickets.jira import adf
 from issue_sync.tickets.jira.backend import FOOTER, build_description, build_summary
 
@@ -57,17 +57,18 @@ def test_description_layout() -> None:
     assert document["type"] == "doc"
     assert document["version"] == 1
     assert [b["type"] for b in document["content"]] == [
-        "paragraph", "paragraph", "rule", "bulletList", "paragraph",
+        "paragraph", "paragraph", "rule", "paragraph", "bulletList", "paragraph",
     ]  # fmt: skip
     assert _texts(document) == [
         "Clicking export shows an error.",
         "Since Monday.",
+        "AI triage: ", "not available. Set the priority and assignee manually.",
         "Reporter: ", "Alice",
         "Contact: ", "alice@example.com",
         "Full history: ", "https://sync.example.com/r/123",
         FOOTER,
     ]  # fmt: skip
-    link = document["content"][3]["content"][2]["content"][0]["content"][1]
+    link = document["content"][4]["content"][2]["content"][0]["content"][1]
     assert link["marks"] == [{"type": "link", "attrs": {"href": "https://sync.example.com/r/123"}}]
 
 
@@ -95,3 +96,24 @@ def test_summary_is_truncated_to_jira_limit() -> None:
     summary = build_summary("x" * 300)
     assert len(summary) == 255
     assert summary.endswith("…")
+
+
+def test_description_shows_the_ai_triage() -> None:
+    triage = TriageNote(
+        type="bug",
+        urgency="high",
+        assignee_role="backend",
+        summary="Export\nbroken",
+        reason="Finance blocked [link](x)",
+        model="deepseek-flash",
+    )
+    texts = _texts(build_description(_content(triage=triage)))
+    start = texts.index("AI triage")
+    assert texts[start : start + 12] == [
+        "AI triage", " (deepseek-flash)",
+        "Category: ", "bug",
+        "Urgency: ", "high",
+        "Suggested team: ", "backend",
+        "Summary: ", "Export broken",
+        "Reason: ", "Finance blocked [link](x)",
+    ]  # fmt: skip

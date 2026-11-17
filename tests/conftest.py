@@ -17,3 +17,8 @@ def jira_example_path() -> Path:
 @pytest.fixture
 def slack_example_path() -> Path:
     return CONFIG_DIR / "slack.example.yaml"
+
+
+@pytest.fixture
+def classifier_example_path() -> Path:
+    return CONFIG_DIR / "classifier.example.yaml"

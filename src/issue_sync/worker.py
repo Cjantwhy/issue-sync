@@ -5,7 +5,8 @@ Run with: arq issue_sync.worker.WorkerSettings
 Jobs:
 - `poll_documents` (cron): enqueue `sync_document` for every enabled worksheet.
 - `sync_document`: worksheet -> database; enqueues `push_ticket` for pending records.
-- `push_ticket`: database -> ticket system for one record, retried with backoff.
+- `push_ticket`: AI triage (new records), then database -> ticket system for one record,
+  retried with backoff.
 """
 
 import logging
@@ -16,6 +17,7 @@ from arq import Retry, cron, func
 from arq.connections import RedisSettings
 from sqlalchemy import select
 
+from issue_sync.classify.openai_compat import create_classifier
 from issue_sync.db.models import Document
 from issue_sync.db.session import create_engine, create_sessionmaker
 from issue_sync.log_setup import configure_logging
@@ -24,7 +26,7 @@ from issue_sync.sources.sheets.client import create_sheets_client
 from issue_sync.sources.sheets.errors import SheetLayoutError, SheetsError
 from issue_sync.startup_checks import run_startup_checks
 from issue_sync.sync.inbound import InboundSync
-from issue_sync.sync.push import push_record
+from issue_sync.sync.push import Triage, push_record
 from issue_sync.sync.retry import poll_schedule, retry_delay
 from issue_sync.tickets.jira.backend import JiraBackend, create_jira_client
 
@@ -48,6 +50,10 @@ async def startup(ctx: dict[str, Any]) -> None:
         sessionmaker=sessionmaker,
         http=http,
         ticket_backend=JiraBackend(create_jira_client(settings), configs.jira),
+        triage=Triage(
+            create_classifier(settings, configs.classifier, http),
+            max_attempts=settings.llm_max_attempts,
+        ),
         inbound=InboundSync(
             sessionmaker, create_sheets_client(settings, http), str(settings.public_base_url)
         ),
@@ -113,7 +119,11 @@ async def sync_document(ctx: dict[str, Any], document_id: int) -> dict[str, int]
 async def push_ticket(ctx: dict[str, Any], record_id: int) -> str:
     settings: Settings = ctx["settings"]
     result = await push_record(
-        ctx["sessionmaker"], ctx["ticket_backend"], record_id, str(settings.public_base_url)
+        ctx["sessionmaker"],
+        ctx["ticket_backend"],
+        record_id,
+        str(settings.public_base_url),
+        triage=ctx["triage"],
     )
     if result.outcome != "failed":
         return result.outcome

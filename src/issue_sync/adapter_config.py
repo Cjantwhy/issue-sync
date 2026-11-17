@@ -67,9 +67,26 @@ class SlackConfig(_StrictModel):
     users: dict[NonEmptyStr, NonEmptyStr]
 
 
+class ClassifierConfig(_StrictModel):
+    """What each internal value means, in words the model can act on.
+
+    The database only has names like "ops"; the model needs to know what ops handles.
+    """
+
+    # ai_judgement_type.type_name -> description
+    types: dict[NonEmptyStr, NonEmptyStr]
+    # ai_judgement_urgency.urgency_level_name -> description
+    urgencies: dict[NonEmptyStr, NonEmptyStr]
+    # assignee_role.role_name -> what the team handles
+    roles: dict[NonEmptyStr, NonEmptyStr]
+    # Extra instructions appended to the system prompt (e.g. output language).
+    guidelines: str | None = None
+
+
 class AdapterConfigs(_StrictModel):
     jira: JiraConfig
     slack: SlackConfig
+    classifier: ClassifierConfig
 
 
 def _load_yaml_model[M: BaseModel](path: Path, model: type[M]) -> M:
@@ -100,5 +117,15 @@ def load_slack_config(path: Path) -> SlackConfig:
     return _load_yaml_model(path, SlackConfig)
 
 
-def load_adapter_configs(jira_path: Path, slack_path: Path) -> AdapterConfigs:
-    return AdapterConfigs(jira=load_jira_config(jira_path), slack=load_slack_config(slack_path))
+def load_classifier_config(path: Path) -> ClassifierConfig:
+    return _load_yaml_model(path, ClassifierConfig)
+
+
+def load_adapter_configs(
+    jira_path: Path, slack_path: Path, classifier_path: Path
+) -> AdapterConfigs:
+    return AdapterConfigs(
+        jira=load_jira_config(jira_path),
+        slack=load_slack_config(slack_path),
+        classifier=load_classifier_config(classifier_path),
+    )

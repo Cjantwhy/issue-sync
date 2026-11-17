@@ -17,12 +17,15 @@ SEED = InternalConstants(
     statuses=frozenset({"open", "in_progress", "done"}),
     urgencies=frozenset({"critical", "high", "medium", "low"}),
     roles=frozenset({"backend", "frontend", "ops", "support"}),
+    types=frozenset({"bug", "data_issue", "access_request", "question"}),
 )
 
 
 @pytest.fixture
-def example_configs(jira_example_path: Path, slack_example_path: Path) -> AdapterConfigs:
-    return load_adapter_configs(jira_example_path, slack_example_path)
+def example_configs(
+    jira_example_path: Path, slack_example_path: Path, classifier_example_path: Path
+) -> AdapterConfigs:
+    return load_adapter_configs(jira_example_path, slack_example_path, classifier_example_path)
 
 
 def _with(
@@ -33,6 +36,7 @@ def _with(
     return AdapterConfigs(
         jira=configs.jira.model_copy(update=jira or {}),
         slack=configs.slack.model_copy(update=slack or {}),
+        classifier=configs.classifier,
     )
 
 
@@ -47,6 +51,7 @@ def test_every_missing_mapping_is_reported(example_configs: AdapterConfigs) -> N
         statuses=SEED.statuses | {"blocked"},
         urgencies=SEED.urgencies | {"trivial"},
         roles=SEED.roles | {"security"},
+        types=SEED.types | {"incident"},
     )
     report = check_mappings(constants, example_configs)
     assert not report.ok
@@ -55,6 +60,9 @@ def test_every_missing_mapping_is_reported(example_configs: AdapterConfigs) -> N
         "jira.yaml: priorities has no entry for ai_judgement_urgency value 'trivial'",
         "jira.yaml: assignees has no entry for assignee_role value 'security'",
         "slack.yaml: users has no entry for assignee_role value 'security'",
+        "classifier.yaml: types has no entry for ai_judgement_type value 'incident'",
+        "classifier.yaml: urgencies has no entry for ai_judgement_urgency value 'trivial'",
+        "classifier.yaml: roles has no entry for assignee_role value 'security'",
     ]
 
 
@@ -69,7 +77,7 @@ def test_empty_constant_table_is_fatal_and_reported_once(
     example_configs: AdapterConfigs,
 ) -> None:
     constants = InternalConstants(
-        statuses=SEED.statuses, urgencies=SEED.urgencies, roles=frozenset()
+        statuses=SEED.statuses, urgencies=SEED.urgencies, roles=frozenset(), types=SEED.types
     )
     report = check_mappings(constants, example_configs)
     assert not report.ok
@@ -90,10 +98,13 @@ def test_extra_config_keys_are_warnings_only(
 
 def test_ensure_mappings_raises_with_all_problems(example_configs: AdapterConfigs) -> None:
     constants = InternalConstants(
-        statuses=SEED.statuses | {"blocked"}, urgencies=SEED.urgencies, roles=SEED.roles | {"qa"}
+        statuses=SEED.statuses | {"blocked"},
+        urgencies=SEED.urgencies,
+        roles=SEED.roles | {"qa"},
+        types=SEED.types,
     )
     with pytest.raises(StartupCheckError) as exc_info:
         ensure_mappings(constants, example_configs)
     message = str(exc_info.value)
     assert "'blocked'" in message
-    assert message.count("'qa'") == 2  # missing in both jira.yaml and slack.yaml
+    assert message.count("'qa'") == 3  # missing in jira.yaml, slack.yaml and classifier.yaml

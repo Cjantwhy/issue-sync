@@ -3,7 +3,7 @@ from fastapi.testclient import TestClient
 
 from issue_sync.api import webhooks
 from issue_sync.api.app import create_app
-from issue_sync.settings import Settings
+from tests.settings_factory import make_settings
 
 SECRET = "s" * 40
 EVENT = {"spreadsheet_id": "1AbC", "worksheet_name": "Requests"}
@@ -17,17 +17,7 @@ def queued() -> list[int]:
 
 @pytest.fixture
 def client(queued: list[int]) -> TestClient:
-    app = create_app(
-        Settings(
-            database_url="postgresql+asyncpg://u:p@db/x",
-            redis_url="redis://r:6379/0",
-            jira_base_url="https://example.atlassian.net",
-            jira_email="bot@example.com",
-            jira_api_token="token",
-            public_base_url="http://localhost:8000",
-            sheets_webhook_secret=SECRET,
-        )
-    )
+    app = create_app(make_settings(sheets_webhook_secret=SECRET))
 
     async def find(spreadsheet_id: str, worksheet_name: str) -> tuple[int, bool] | None:
         return DOCUMENTS.get((spreadsheet_id, worksheet_name))

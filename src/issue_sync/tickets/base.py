@@ -18,14 +18,27 @@ class _Model(BaseModel):
     model_config = ConfigDict(frozen=True)
 
 
+class TriageNote(_Model):
+    """The AI judgement, shown to the assignee in the ticket. Internal values."""
+
+    type: str
+    urgency: str
+    assignee_role: str
+    summary: str
+    reason: str
+    model: str
+
+
 class TicketContent(_Model):
-    """Spreadsheet-owned fields. Pushed on create and on every sheet-side change."""
+    """Fields this system owns in the ticket. Pushed on create and on every sheet-side change."""
 
     title: str | None
     description: str | None
     reporter: str | None
     contact: str | None
     detail_url: str
+    # None: the record has no AI judgement (classification failed, or it predates AI triage).
+    triage: TriageNote | None = None
 
 
 class TicketDraft(TicketContent):

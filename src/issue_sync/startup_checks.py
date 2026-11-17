@@ -12,7 +12,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from issue_sync.adapter_config import AdapterConfigs, load_adapter_configs
-from issue_sync.db.models import AiJudgementUrgency, AssigneeRole, DocumentRecordStatus
+from issue_sync.db.models import (
+    AiJudgementType,
+    AiJudgementUrgency,
+    AssigneeRole,
+    DocumentRecordStatus,
+)
 from issue_sync.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -27,6 +32,7 @@ class InternalConstants:
     statuses: frozenset[str]
     urgencies: frozenset[str]
     roles: frozenset[str]
+    types: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -44,17 +50,28 @@ async def load_internal_constants(engine: AsyncEngine) -> InternalConstants:
         statuses = (await conn.scalars(select(DocumentRecordStatus.status_name))).all()
         urgencies = (await conn.scalars(select(AiJudgementUrgency.urgency_level_name))).all()
         roles = (await conn.scalars(select(AssigneeRole.role_name))).all()
-    return InternalConstants(frozenset(statuses), frozenset(urgencies), frozenset(roles))
+        types = (await conn.scalars(select(AiJudgementType.type_name))).all()
+    return InternalConstants(
+        frozenset(statuses), frozenset(urgencies), frozenset(roles), frozenset(types)
+    )
 
 
 def check_mappings(constants: InternalConstants, configs: AdapterConfigs) -> MappingReport:
-    jira, slack = configs.jira, configs.slack
+    jira, slack, classifier = configs.jira, configs.slack, configs.classifier
     # (constant table, internal values, config file label, mapped keys)
     pairs = [
         ("document_record_status", constants.statuses, "jira.yaml: statuses", jira.statuses),
         ("ai_judgement_urgency", constants.urgencies, "jira.yaml: priorities", jira.priorities),
         ("assignee_role", constants.roles, "jira.yaml: assignees", jira.assignees),
         ("assignee_role", constants.roles, "slack.yaml: users", slack.users),
+        ("ai_judgement_type", constants.types, "classifier.yaml: types", classifier.types),
+        (
+            "ai_judgement_urgency",
+            constants.urgencies,
+            "classifier.yaml: urgencies",
+            classifier.urgencies,
+        ),
+        ("assignee_role", constants.roles, "classifier.yaml: roles", classifier.roles),
     ]
 
     missing: list[str] = []
@@ -86,7 +103,9 @@ def ensure_mappings(constants: InternalConstants, configs: AdapterConfigs) -> No
 
 async def run_startup_checks(settings: Settings, engine: AsyncEngine) -> AdapterConfigs:
     """Load adapter configs and verify they cover every internal value. Raises on failure."""
-    configs = load_adapter_configs(settings.jira_config_path, settings.slack_config_path)
+    configs = load_adapter_configs(
+        settings.jira_config_path, settings.slack_config_path, settings.classifier_config_path
+    )
     constants = await load_internal_constants(engine)
     ensure_mappings(constants, configs)
     logger.info("Startup checks passed")

@@ -12,6 +12,7 @@ Requires Docker with Compose v2.
 cp .env.example .env
 cp config/jira.example.yaml config/jira.yaml
 cp config/slack.example.yaml config/slack.yaml
+cp config/classifier.example.yaml config/classifier.yaml
 # plus the Google service account key in secrets/ (see "Google Sheets setup")
 docker compose up -d --build --wait
 curl localhost:8000/health
@@ -19,8 +20,8 @@ curl localhost:8000/health
 ```
 
 `migrate` applies the database migrations and exits. `api` and `worker` start only after it succeeds.
-Both refuse to start if an internal status, urgency or role in the database has no mapping
-in `config/jira.yaml` or `config/slack.yaml`.
+Both refuse to start if an internal status, category, urgency or role in the database has
+no entry in `config/jira.yaml`, `config/slack.yaml` or `config/classifier.yaml`.
 
 ## Development
 
@@ -70,14 +71,29 @@ For near-instant sync, install the Apps Script trigger in
 [`apps_script/Code.gs`](apps_script/Code.gs). It calls `POST /webhooks/sheets`, so the api
 must be reachable from Google (for local testing, use a tunnel such as `cloudflared`).
 
+## AI triage setup
+
+Any OpenAI-compatible chat completions API works. Set `LLM_BASE_URL`, `LLM_MODEL` and
+`LLM_API_KEY` in `.env` (DeepSeek is the default in `.env.example`), and copy
+`config/classifier.example.yaml` to `config/classifier.yaml`. That file describes each
+category, urgency and team so the model knows what to choose. Check the quality on the
+labelled cases before going live, and again after changing the prompt config or model:
+
+```bash
+uv run issue-sync eval-classifier                     # per-field accuracy and latency
+uv run issue-sync eval-classifier --min-accuracy 0.9  # exit 1 below 90 %
+```
+
 ## How a row becomes a ticket
 
 1. A trigger or the poll enqueues `sync_document`, which re-reads the worksheet.
 2. Rows without a `System ID` get a UUID and a detail link written back to the sheet.
 3. Rows whose content changed (SHA-256 of the row, system columns excluded) are saved
    with a `created` or `source_modified` event and marked for a push.
-4. `push_ticket` creates the Jira issue, or updates its title and description, retrying
-   with backoff on transient failures. Pushes are serialized per row and look for an
-   existing ticket before creating one, so a row never produces two tickets.
+4. `push_ticket` classifies new requests with the LLM (category, urgency, team, summary,
+   reason), then creates the Jira issue with the mapped priority and assignee, or updates
+   the title and description of an existing one. It retries with backoff on transient
+   failures. Pushes are serialized per row and look for an existing ticket before
+   creating one, so a row never produces two tickets.
 
 See [docs/decisions.md](docs/decisions.md) for design decisions.

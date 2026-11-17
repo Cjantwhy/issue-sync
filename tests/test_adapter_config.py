@@ -29,8 +29,11 @@ def _jira_data(**overrides: object) -> dict[str, object]:
     return data
 
 
-def test_example_files_load(jira_example_path: Path, slack_example_path: Path) -> None:
-    configs = load_adapter_configs(jira_example_path, slack_example_path)
+def test_example_files_load(
+    jira_example_path: Path, slack_example_path: Path, classifier_example_path: Path
+) -> None:
+    configs = load_adapter_configs(jira_example_path, slack_example_path, classifier_example_path)
+    assert set(configs.classifier.roles) == {"backend", "frontend", "ops", "support"}
     assert configs.jira.project_key == "OPS"
     assert configs.jira.issue_type == "Task"
     assert configs.slack.users["backend"].startswith("U")

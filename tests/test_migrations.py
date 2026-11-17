@@ -107,7 +107,9 @@ def test_example_configs_cover_seeded_constants(database_url: str) -> None:
 
     constants = asyncio.run(load())
     configs = load_adapter_configs(
-        CONFIG_DIR / "jira.example.yaml", CONFIG_DIR / "slack.example.yaml"
+        CONFIG_DIR / "jira.example.yaml",
+        CONFIG_DIR / "slack.example.yaml",
+        CONFIG_DIR / "classifier.example.yaml",
     )
     report = check_mappings(constants, configs)
     assert report.ok, report.missing

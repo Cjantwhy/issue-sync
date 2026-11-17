@@ -5,16 +5,23 @@ import asyncio
 import re
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
 import httpx
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from issue_sync.adapter_config import AdapterConfigError, load_jira_config
+from issue_sync.adapter_config import (
+    AdapterConfigError,
+    load_classifier_config,
+    load_jira_config,
+)
+from issue_sync.classify.evaluation import Report, evaluate, load_cases
+from issue_sync.classify.openai_compat import create_classifier
 from issue_sync.db.models import Document, DocumentType
 from issue_sync.db.session import create_engine, create_sessionmaker
-from issue_sync.settings import DatabaseSettings, GoogleSettings, JiraSettings
+from issue_sync.settings import DatabaseSettings, GoogleSettings, JiraSettings, LlmSettings
 from issue_sync.sources.sheets.client import create_sheets_client
 from issue_sync.sources.sheets.errors import SheetLayoutError, SheetsError
 from issue_sync.sources.sheets.layout import REQUIRED_HEADERS, DocumentMapping, parse_sheet
@@ -167,6 +174,30 @@ def add_document(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- eval-classifier ----------
+
+
+async def _eval_classifier(settings: LlmSettings, cases_path: Path) -> Report:
+    config = load_classifier_config(settings.classifier_config_path)
+    cases = load_cases(cases_path)
+    async with httpx.AsyncClient() as http:
+        return await evaluate(create_classifier(settings, config, http), cases)
+
+
+def eval_classifier(args: argparse.Namespace) -> int:
+    try:
+        settings = LlmSettings()  # type: ignore[call-arg]  # from the environment
+        report = asyncio.run(_eval_classifier(settings, Path(args.cases)))
+    except (ValidationError, AdapterConfigError, ValueError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    print(report.render())
+    if args.min_accuracy is not None and report.all_correct < args.min_accuracy:
+        print(f"\nBelow the required accuracy of {args.min_accuracy:.0%}.")
+        return 1
+    return 0
+
+
 # ---------- entry point ----------
 
 
@@ -191,7 +222,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Override a header name; FIELD= drops an optional field. Repeatable. "
         f"Defaults: {', '.join(f'{k}={v}' for k, v in DEFAULT_HEADERS.items())}",
     )
+    evaluation = commands.add_parser(
+        "eval-classifier", help="Run the AI triage against labelled cases and report accuracy"
+    )
+    evaluation.add_argument("--cases", default="eval/triage_cases.yaml", help="Cases YAML file")
+    evaluation.add_argument(
+        "--min-accuracy",
+        type=float,
+        default=None,
+        metavar="0.0-1.0",
+        help="Exit with code 1 if fewer cases than this get all three fields right",
+    )
     args = parser.parse_args(argv)
+    if args.command == "eval-classifier":
+        return eval_classifier(args)
     if args.command == "jira-check":
         return jira_check()
     if args.command == "add-document":

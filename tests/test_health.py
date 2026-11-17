@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 from issue_sync.api import health
 from issue_sync.api.app import create_app
-from issue_sync.settings import Settings
+from tests.settings_factory import make_settings
 
 
 async def _ok() -> None:
@@ -24,15 +24,7 @@ async def _hang() -> None:
 
 @pytest.fixture
 def app() -> FastAPI:
-    settings = Settings(
-        database_url="postgresql+asyncpg://u:p@db/x",
-        redis_url="redis://r:6379/0",
-        jira_base_url="https://example.atlassian.net",
-        jira_email="bot@example.com",
-        jira_api_token="token",
-        public_base_url="http://localhost:8000",
-        sheets_webhook_secret="x" * 32,
-    )
+    settings = make_settings()
     return create_app(settings)
 
 

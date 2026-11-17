@@ -176,3 +176,39 @@ One entry per trade-off: context, what was chosen, and why not the alternative.
 
 ### Service account key mounted as a directory
 - **Chosen:** Compose mounts `./secrets` read-only rather than the single key file. Docker silently creates a missing single-file mount as an empty directory, which then fails with a confusing error.
+
+## Milestone 4 — AI triage
+
+### One LLM call decides everything
+- **Context:** Category, urgency, team, summary and reason could come from separate models, e.g. a trained classifier for the labels plus an LLM for the text, or a cheap model that escalates to a stronger one.
+- **Chosen:** One structured call to one model. Requests are judged once each and volume is low, so cost and latency are not the bottleneck.
+- **Not chosen:** A trained classifier needs labelled history, and there is none yet. Escalating between models needs a calibrated confidence score, and self-reported LLM confidence is not one. The data for both accumulates on its own: every judgement stores its `model`, and the dashboard (milestone 8) compares it with the values humans set in Jira. Deterministic overrides belong to the assignment rules in milestone 5, which stay auditable.
+
+### Triage runs inside the push, once per record
+- **Chosen:** When a record has no ticket and no judgement, `push_ticket` classifies it before creating the ticket, under the same `ticket_sync` row lock, so a record is never classified twice concurrently. The judgement is stored in the same transaction as the attempt. If Jira then fails, the retry reuses the stored judgement instead of calling the LLM again. Only new records are judged; sheet edits do not trigger a new judgement.
+- **Not chosen:** A separate classify job between sync and push. The push would then have to wait for it, and an ordering bug would create tickets without priority or assignee.
+
+### Keep creating tickets when the LLM is down
+- **Chosen:** Timeouts, rate limits, 5xx and malformed output are retried with the normal backoff. After `LLM_MAX_ATTEMPTS` (default 3), the ticket is created without a judgement: Jira's default priority, no assignee, and a description that says AI triage is not available. Errors a retry cannot fix (401 bad key, 402 no balance, 400) fall back at once.
+- **Not chosen:** Holding tickets until the LLM recovers. An AI outage would then stop all intake, which is worse than a ticket a human has to triage.
+
+### Allowed values come from the database, descriptions from `classifier.yaml`
+- **Chosen:** The model may only answer with names from the constant tables. `config/classifier.yaml` describes each category, urgency and team in words, because "ops" alone does not tell the model what ops handles. Its keys go through the same startup check as `jira.yaml`. The schema has no column for descriptions, and wording is configuration, not data.
+
+### JSON mode plus validation, not provider-enforced schemas
+- **Context:** DeepSeek supports `response_format: json_object` but not `json_schema`.
+- **Chosen:** `json_object` by default, with the allowed values and an example in the prompt. Every reply is validated in code: enums are checked case-insensitively, free text is length-capped, and blank or invalid output counts as a retryable failure. `LLM_RESPONSE_FORMAT=json_schema` turns on strict schemas for providers that support them. `temperature` is 0.
+- **Not chosen:** Tool calling as a structured-output workaround. It adds a round of parsing without stronger guarantees than validation.
+
+### Provider differences go into `LLM_EXTRA_BODY`
+- **Chosen:** The client speaks plain OpenAI chat completions. Provider-specific fields come from a JSON env var and are merged into the request body; they can never override the model, messages or response format. For DeepSeek, `{"thinking": {"type": "disabled"}}` turns off the default reasoning mode, which costs latency and tokens without helping a short classification.
+
+### Request text is data, and only the request text is sent
+- **Chosen:** The system prompt says the request is untrusted and any instructions in it must be ignored. Title and description are sent as a JSON object, so quotes in them cannot close the data block, and they are truncated to a fixed size. Reporter names and contact details are never sent to the LLM. Because the output is limited to fixed enums, a successful injection could at worst mislabel one request. Verified live: a request asking to be marked critical and assigned to ops was classified as a low-urgency question, and the model's reason said it had ignored the embedded instructions.
+
+### The judgement is shown in the ticket
+- **Chosen:** The Jira description has an "AI triage" section with category, urgency, suggested team, summary, reason and model, so the assignee can see why the ticket landed with them and correct it. Because the description is rebuilt on every push, the section is part of `pushed_hash`.
+
+### `issue-sync eval-classifier`
+- **Chosen:** A labelled case file (`eval/triage_cases.yaml`) is run against the real model, and the command reports accuracy per field, accuracy on all three, errors and latency. Urgency is subjective, so a case may list more than one acceptable value. `--min-accuracy` makes it usable as a gate. A unit test checks that every expected value exists in the classifier config.
+- **Caveat:** The 12 bundled cases are hand-written and catch regressions; they are not a benchmark. Real accuracy will come from comparing judgements with human corrections (milestone 8).

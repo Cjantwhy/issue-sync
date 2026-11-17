@@ -14,12 +14,19 @@ from alembic import command
 from sqlalchemy import func, pool, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from issue_sync.db.models import Document, DocumentRecord, DocumentRecordHistory, TicketSync
+from issue_sync.classify.base import Classification, ClassifierError, ClassifierInput, Judgement
+from issue_sync.db.models import (
+    AiJudgement,
+    Document,
+    DocumentRecord,
+    DocumentRecordHistory,
+    TicketSync,
+)
 from issue_sync.db.session import create_sessionmaker
 from issue_sync.sources.sheets.client import CellWrite
 from issue_sync.sources.sheets.errors import SheetLayoutError
 from issue_sync.sync.inbound import InboundSync
-from issue_sync.sync.push import push_record
+from issue_sync.sync.push import Triage, push_record
 from issue_sync.tickets.base import (
     TicketBackendUnavailable,
     TicketContent,
@@ -95,6 +102,7 @@ class FakeTickets:
         self.calls: list[str] = []
         self.lose_next_create_response = False
         self.reject_creates = False
+        self.created_drafts: list[TicketDraft] = []
 
     async def find_by_system_id(self, system_id: uuid.UUID) -> TicketRef | None:
         self.calls.append("find")
@@ -108,6 +116,7 @@ class FakeTickets:
         if self.reject_creates:
             raise TicketRequestRejected("Field 'priority' cannot be set")
         await asyncio.sleep(0.01)  # a slow request: overlapping pushes would both get here
+        self.created_drafts.append(draft)
         key = f"OPS-{len(self.tickets) + 1}"
         self.tickets[key] = {"system_id": draft.system_id, "content": draft}
         if self.lose_next_create_response:
@@ -512,3 +521,115 @@ async def test_long_titles_are_cut_to_the_column_size(
         title_length, raw_title = lengths.one()
     assert title_length == 255
     assert len(raw_title) == 300
+
+
+# ---------- AI triage before create ----------
+
+JUDGEMENT = Judgement(
+    type="bug",
+    urgency="high",
+    assignee_role="backend",
+    summary="Export is broken.",
+    reason="Finance is blocked.",
+)
+
+
+class FakeClassifier:
+    def __init__(self, *outcomes: Judgement | ClassifierError) -> None:
+        self.outcomes = list(outcomes)
+        self.requests: list[ClassifierInput] = []
+
+    async def classify(self, request: ClassifierInput) -> Classification:
+        self.requests.append(request)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, ClassifierError):
+            raise outcome
+        return Classification(judgement=outcome, model="fake-model")
+
+
+async def _judgements(sessionmaker: async_sessionmaker[AsyncSession]) -> list[AiJudgement]:
+    async with sessionmaker() as session:
+        return list(await session.scalars(select(AiJudgement)))
+
+
+async def test_new_ticket_is_triaged_once_and_carries_the_judgement(
+    sessionmaker: async_sessionmaker[AsyncSession], document_id: int
+) -> None:
+    record_id = await _one_record(sessionmaker, document_id)
+    tickets, classifier = FakeTickets(), FakeClassifier(JUDGEMENT)
+    triage = Triage(classifier, max_attempts=3)
+
+    created = await push_record(sessionmaker, tickets, record_id, BASE_URL, triage=triage)
+    async with sessionmaker() as session, session.begin():
+        await session.execute(text("UPDATE document_record SET title = 'Export fails (CSV)'"))
+    updated = await push_record(sessionmaker, tickets, record_id, BASE_URL, triage=triage)
+
+    assert (created.outcome, updated.outcome) == ("created", "updated")
+    assert classifier.requests == [ClassifierInput(title="Export fails", description="Details")]
+    draft = tickets.created_drafts[0]
+    assert (draft.urgency, draft.assignee_role) == ("high", "backend")
+    assert draft.triage is not None and draft.triage.model == "fake-model"
+    # The update keeps showing the same judgement; it is not re-classified.
+    assert tickets.tickets["OPS-1"]["content"].triage == draft.triage
+    [stored] = await _judgements(sessionmaker)
+    assert (stored.summary, stored.model) == ("Export is broken.", "fake-model")
+
+
+async def test_transient_llm_failures_retry_then_create_without_triage(
+    sessionmaker: async_sessionmaker[AsyncSession], document_id: int
+) -> None:
+    record_id = await _one_record(sessionmaker, document_id)
+    down = ClassifierError("LLM API returned 503", retryable=True)
+    tickets, classifier = FakeTickets(), FakeClassifier(down, down, down)
+    triage = Triage(classifier, max_attempts=3)
+
+    first = await push_record(sessionmaker, tickets, record_id, BASE_URL, triage=triage)
+    second = await push_record(sessionmaker, tickets, record_id, BASE_URL, triage=triage)
+    assert (first.outcome, second.outcome) == ("failed", "failed")
+    assert first.retryable and tickets.calls == []
+    assert "503" in ((await _ticket_sync(sessionmaker, record_id)).last_error or "")
+
+    third = await push_record(sessionmaker, tickets, record_id, BASE_URL, triage=triage)
+
+    assert third.outcome == "created"
+    draft = tickets.created_drafts[0]
+    assert (draft.urgency, draft.assignee_role, draft.triage) == (None, None, None)
+    assert await _judgements(sessionmaker) == []
+    assert (await _ticket_sync(sessionmaker, record_id)).retry_count == 0
+
+
+async def test_permanent_llm_failure_creates_without_triage_immediately(
+    sessionmaker: async_sessionmaker[AsyncSession], document_id: int
+) -> None:
+    record_id = await _one_record(sessionmaker, document_id)
+    tickets = FakeTickets()
+    classifier = FakeClassifier(ClassifierError("LLM API returned 401: invalid api key"))
+
+    result = await push_record(
+        sessionmaker, tickets, record_id, BASE_URL, triage=Triage(classifier, max_attempts=3)
+    )
+
+    assert result.outcome == "created"
+    assert tickets.created_drafts[0].urgency is None
+
+
+async def test_judgement_survives_a_jira_failure(
+    sessionmaker: async_sessionmaker[AsyncSession], document_id: int
+) -> None:
+    # The LLM answered, then Jira timed out: the retry must reuse the stored judgement.
+    record_id = await _one_record(sessionmaker, document_id)
+    tickets, classifier = FakeTickets(), FakeClassifier(JUDGEMENT)
+    tickets.reject_creates = True
+    triage = Triage(classifier, max_attempts=3)
+
+    assert (
+        await push_record(sessionmaker, tickets, record_id, BASE_URL, triage=triage)
+    ).outcome == "failed"
+    tickets.reject_creates = False
+    assert (
+        await push_record(sessionmaker, tickets, record_id, BASE_URL, triage=triage)
+    ).outcome == "created"
+
+    assert len(classifier.requests) == 1
+    assert len(await _judgements(sessionmaker)) == 1
+    assert tickets.created_drafts[-1].urgency == "high"

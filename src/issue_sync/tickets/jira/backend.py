@@ -19,6 +19,7 @@ from issue_sync.tickets.base import (
     TicketRef,
     TicketSnapshot,
     TransitionNotAvailable,
+    TriageNote,
 )
 from issue_sync.tickets.jira import adf
 from issue_sync.tickets.jira.client import JiraClient
@@ -72,9 +73,41 @@ def build_description(content: TicketContent) -> adf.Node:
     return adf.doc(
         *body,
         adf.rule(),
+        *build_triage_section(content.triage),
         adf.bullet_list(*details),
         adf.paragraph(adf.text(FOOTER, em=True)),
     )
+
+
+def build_triage_section(triage: TriageNote | None) -> list[adf.Node]:
+    if triage is None:
+        return [
+            adf.paragraph(
+                adf.text("AI triage: ", strong=True),
+                adf.text("not available. Set the priority and assignee manually.", em=True),
+            )
+        ]
+    rows = [
+        ("Category", triage.type),
+        ("Urgency", triage.urgency),
+        ("Suggested team", triage.assignee_role),
+        ("Summary", triage.summary),
+        ("Reason", triage.reason),
+    ]
+    return [
+        adf.paragraph(adf.text("AI triage", strong=True), adf.text(f" ({triage.model})", em=True)),
+        adf.bullet_list(
+            *(
+                [adf.text(f"{label}: ", strong=True), adf.text(clean)]
+                for label, value in rows
+                if (clean := _single_line(value))
+            )
+        ),
+    ]
+
+
+def _single_line(value: str) -> str:
+    return _WHITESPACE.sub(" ", adf.clean_text(value)).strip()
 
 
 def _issue_path(key: str, suffix: str = "") -> str:

@@ -1,0 +1,28 @@
+# AI triage config. Copy to config/classifier.yaml (git-ignored) and adapt the wording.
+# The keys must match the database constant tables exactly (checked at startup); the
+# descriptions are what the model reads to choose between them, so be concrete.
+
+# ai_judgement_type.type_name -> what the category covers
+types:
+  bug: "Something is broken: errors, crashes, wrong results, or a feature not behaving as documented."
+  data_issue: "Data is wrong, missing, duplicated or needs correcting, or an import/export of data needs fixing."
+  access_request: "Someone needs an account, a permission, a role, a password reset or access to a system or file."
+  question: "A how-to question, a request for information, or a suggestion; nothing is broken."
+
+# ai_judgement_urgency.urgency_level_name -> when it needs action
+urgencies:
+  critical: "A production system is down, data is being lost, or many people cannot work. Act within the hour."
+  high: "A key workflow is blocked for a person or team, with no workaround. Act today."
+  medium: "Something is impaired but a workaround exists, or a deadline is a few days away."
+  low: "Minor inconvenience, cosmetic problem, question or suggestion. Handle when convenient."
+
+# assignee_role.role_name -> what the team handles
+roles:
+  backend: "Server-side application logic, APIs, databases, data fixes, integrations and background jobs."
+  frontend: "Web and mobile user interfaces: layout, buttons, forms, display and browser-specific problems."
+  ops: "Infrastructure, deployments, outages, performance, networking, accounts and permissions."
+  support: "How-to questions, training, documentation and anything that needs no engineering work."
+
+# Optional extra instructions for the model.
+guidelines: |
+  If the request is ambiguous, prefer the less urgent level and say so in the reason.
