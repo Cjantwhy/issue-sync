@@ -27,6 +27,9 @@ def app() -> FastAPI:
     settings = Settings(
         database_url="postgresql+asyncpg://u:p@db/x",
         redis_url="redis://r:6379/0",
+        jira_base_url="https://example.atlassian.net",
+        jira_email="bot@example.com",
+        jira_api_token="token",
     )
     return create_app(settings)
 

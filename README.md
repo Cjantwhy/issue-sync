@@ -35,4 +35,17 @@ TEST_DATABASE_URL=postgresql+asyncpg://issue_sync:change-me@localhost:5432/postg
   uv run pytest -m integration
 ```
 
+## Jira setup check
+
+After filling in the `JIRA_*` variables in `.env` and `config/jira.yaml`, verify both
+against your Jira site:
+
+```bash
+uv run issue-sync jira-check
+```
+
+It checks the credentials and service account, project and issue type, create-screen
+fields, priorities, workflow statuses and assignees. It exits with a non-zero code if
+any check fails.
+
 See [docs/decisions.md](docs/decisions.md) for design decisions.
