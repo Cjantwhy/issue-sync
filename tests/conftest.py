@@ -22,3 +22,8 @@ def slack_example_path() -> Path:
 @pytest.fixture
 def classifier_example_path() -> Path:
     return CONFIG_DIR / "classifier.example.yaml"
+
+
+@pytest.fixture
+def assignment_example_path() -> Path:
+    return CONFIG_DIR / "assignment.example.yaml"

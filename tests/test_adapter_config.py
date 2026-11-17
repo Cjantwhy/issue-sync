@@ -30,9 +30,15 @@ def _jira_data(**overrides: object) -> dict[str, object]:
 
 
 def test_example_files_load(
-    jira_example_path: Path, slack_example_path: Path, classifier_example_path: Path
+    jira_example_path: Path,
+    slack_example_path: Path,
+    classifier_example_path: Path,
+    assignment_example_path: Path,
 ) -> None:
-    configs = load_adapter_configs(jira_example_path, slack_example_path, classifier_example_path)
+    configs = load_adapter_configs(
+        jira_example_path, slack_example_path, classifier_example_path, assignment_example_path
+    )
+    assert [r.assign for r in configs.assignment.rules][:2] == ["ops", "ops"]
     assert set(configs.classifier.roles) == {"backend", "frontend", "ops", "support"}
     assert configs.jira.project_key == "OPS"
     assert configs.jira.issue_type == "Task"

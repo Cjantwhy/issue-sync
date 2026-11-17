@@ -133,8 +133,12 @@ class JiraBackend:
     async def aclose(self) -> None:
         await self._client.aclose()
 
+    def ticket_url(self, key: str) -> str:
+        _issue_path(key)  # validates the key
+        return self._client.browse_url(key)
+
     def _ref(self, key: str) -> TicketRef:
-        return TicketRef(key=key, url=self._client.browse_url(key))
+        return TicketRef(key=key, url=self.ticket_url(key))
 
     async def create_ticket(self, draft: TicketDraft) -> TicketRef:
         config = self._config

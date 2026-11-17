@@ -125,6 +125,7 @@ CREATE TABLE ticket_sync (
     pushed_at           TIMESTAMPTZ,
     last_error          TEXT,
     retry_count         INTEGER NOT NULL DEFAULT 0,
+    notified_at         TIMESTAMPTZ,                    -- Slack notification for the new ticket sent; NULL until sent
 
     -- Inbound from the ticket system
     ticket_updated_at     TIMESTAMPTZ,                    -- last ticket update; webhook events older than this are dropped

@@ -1,0 +1,27 @@
+# Assignment rules. Copy to config/assignment.yaml (git-ignored) and adapt.
+#
+# Rules adjust the AI's choice of team and urgency. They are checked from top to bottom
+# and the first match wins. The AI judgement itself is stored unchanged; the rule's
+# effect is applied to the ticket and explained in a Jira comment.
+#
+# Conditions (all given ones must hold; a list matches if any value matches):
+#   type, urgency, assignee_role   the AI's category / urgency / suggested team
+#   keywords                       text in the title or description (case-insensitive)
+#   reporter                       exact reporter name (case-insensitive)
+# Keyword and reporter rules also apply when the AI judgement is unavailable.
+#
+# Actions: assign (a role in assignee_role), set_urgency (an urgency level).
+# Every value is checked against the database at startup. Use `rules: []` for none.
+
+rules:
+  - name: Access requests go to ops
+    when: {type: access_request}
+    assign: ops
+
+  - name: Locked accounts and passwords go to ops
+    when: {keywords: [password, locked out, 密码, 锁定]}
+    assign: ops
+
+  - name: Month-end close is at least high
+    when: {keywords: [month-end, 月结], urgency: [low, medium]}
+    set_urgency: high

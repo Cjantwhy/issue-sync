@@ -23,9 +23,14 @@ SEED = InternalConstants(
 
 @pytest.fixture
 def example_configs(
-    jira_example_path: Path, slack_example_path: Path, classifier_example_path: Path
+    jira_example_path: Path,
+    slack_example_path: Path,
+    classifier_example_path: Path,
+    assignment_example_path: Path,
 ) -> AdapterConfigs:
-    return load_adapter_configs(jira_example_path, slack_example_path, classifier_example_path)
+    return load_adapter_configs(
+        jira_example_path, slack_example_path, classifier_example_path, assignment_example_path
+    )
 
 
 def _with(
@@ -37,6 +42,7 @@ def _with(
         jira=configs.jira.model_copy(update=jira or {}),
         slack=configs.slack.model_copy(update=slack or {}),
         classifier=configs.classifier,
+        assignment=configs.assignment,
     )
 
 

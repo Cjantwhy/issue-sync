@@ -5,8 +5,9 @@ Run with: arq issue_sync.worker.WorkerSettings
 Jobs:
 - `poll_documents` (cron): enqueue `sync_document` for every enabled worksheet.
 - `sync_document`: worksheet -> database; enqueues `push_ticket` for pending records.
-- `push_ticket`: AI triage (new records), then database -> ticket system for one record,
-  retried with backoff.
+- `push_ticket`: AI triage and assignment rules (new records), then database -> ticket
+  system for one record, retried with backoff. Enqueues `notify_ticket` for new tickets.
+- `notify_ticket`: Slack message for a new ticket, sent once (ticket_sync.notified_at).
 """
 
 import logging
@@ -21,11 +22,13 @@ from issue_sync.classify.openai_compat import create_classifier
 from issue_sync.db.models import Document
 from issue_sync.db.session import create_engine, create_sessionmaker
 from issue_sync.log_setup import configure_logging
+from issue_sync.notify.slack import SlackError, create_slack_client
 from issue_sync.settings import Settings, get_settings
 from issue_sync.sources.sheets.client import create_sheets_client
 from issue_sync.sources.sheets.errors import SheetLayoutError, SheetsError
 from issue_sync.startup_checks import run_startup_checks
 from issue_sync.sync.inbound import InboundSync
+from issue_sync.sync.notify import Notifier, notify_record
 from issue_sync.sync.push import Triage, push_record
 from issue_sync.sync.retry import poll_schedule, retry_delay
 from issue_sync.tickets.jira.backend import JiraBackend, create_jira_client
@@ -33,6 +36,13 @@ from issue_sync.tickets.jira.backend import JiraBackend, create_jira_client
 logger = logging.getLogger(__name__)
 
 SYNC_MAX_TRIES = 5
+NOTIFY_MAX_TRIES = 5
+
+
+async def enqueue_notify(ctx: dict[str, Any], record_id: int) -> None:
+    # A fixed job id: arq ignores the enqueue while the job is queued, running or its
+    # result is kept (1 hour), so the per-poll sweep cannot pile up duplicate jobs.
+    await ctx["redis"].enqueue_job("notify_ticket", record_id, _job_id=f"notify:{record_id}")
 
 
 async def startup(ctx: dict[str, Any]) -> None:
@@ -57,6 +67,13 @@ async def startup(ctx: dict[str, Any]) -> None:
         inbound=InboundSync(
             sessionmaker, create_sheets_client(settings, http), str(settings.public_base_url)
         ),
+    )
+    ctx["notifier"] = Notifier(
+        slack=create_slack_client(settings, http),
+        slack_config=configs.slack,
+        rules=configs.assignment,
+        ticket_url=ctx["ticket_backend"].ticket_url,
+        public_base_url=str(settings.public_base_url),
     )
 
 
@@ -109,10 +126,13 @@ async def sync_document(ctx: dict[str, Any], document_id: int) -> dict[str, int]
         return None
     for record_id in report.pending_record_ids:
         await ctx["redis"].enqueue_job("push_ticket", record_id)
+    for record_id in report.unnotified_record_ids:
+        await enqueue_notify(ctx, record_id)
     return {
         "created": report.created,
         "modified": report.modified,
         "pushes_enqueued": len(report.pending_record_ids),
+        "notifications_enqueued": len(report.unnotified_record_ids),
     }
 
 
@@ -124,7 +144,10 @@ async def push_ticket(ctx: dict[str, Any], record_id: int) -> str:
         record_id,
         str(settings.public_base_url),
         triage=ctx["triage"],
+        rules=ctx["adapter_configs"].assignment,
     )
+    if result.outcome in ("created", "linked"):
+        await enqueue_notify(ctx, record_id)
     if result.outcome != "failed":
         return result.outcome
     delay = retry_delay(
@@ -145,11 +168,29 @@ async def push_ticket(ctx: dict[str, Any], record_id: int) -> str:
     return result.outcome
 
 
+async def notify_ticket(ctx: dict[str, Any], record_id: int) -> str:
+    try:
+        return await notify_record(ctx["sessionmaker"], ctx["notifier"], record_id)
+    except SlackError as exc:
+        delay = retry_delay(
+            retryable=exc.retryable,
+            attempt=ctx["job_try"],
+            max_attempts=NOTIFY_MAX_TRIES,
+            retry_after=exc.retry_after,
+        )
+        if delay is not None:
+            raise Retry(defer=delay) from exc
+        # notified_at stays NULL: the poll's sweep re-enqueues it (at most hourly).
+        logger.error("Slack notification for record %s failed: %s", record_id, exc)
+        return "failed"
+
+
 class WorkerSettings:
     functions: ClassVar[list[Any]] = [
         ping,
         func(sync_document, max_tries=SYNC_MAX_TRIES),
         func(push_ticket, max_tries=get_settings().push_max_attempts),
+        func(notify_ticket, max_tries=NOTIFY_MAX_TRIES),
     ]
     cron_jobs: ClassVar[list[Any]] = [
         cron(

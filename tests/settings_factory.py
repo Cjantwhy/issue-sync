@@ -14,6 +14,7 @@ REQUIRED: dict[str, Any] = {
     "llm_base_url": "https://llm.example.com",
     "llm_model": "test-model",
     "llm_api_key": "llm-key",
+    "slack_bot_token": "xoxb-test",
 }
 
 

@@ -14,6 +14,7 @@ from alembic import command
 from sqlalchemy import func, pool, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from issue_sync.adapter_config import AssignmentConfig, SlackConfig
 from issue_sync.classify.base import Classification, ClassifierError, ClassifierInput, Judgement
 from issue_sync.db.models import (
     AiJudgement,
@@ -23,9 +24,11 @@ from issue_sync.db.models import (
     TicketSync,
 )
 from issue_sync.db.session import create_sessionmaker
+from issue_sync.notify.slack import SlackError
 from issue_sync.sources.sheets.client import CellWrite
 from issue_sync.sources.sheets.errors import SheetLayoutError
 from issue_sync.sync.inbound import InboundSync
+from issue_sync.sync.notify import Notifier, notify_record
 from issue_sync.sync.push import Triage, push_record
 from issue_sync.tickets.base import (
     TicketBackendUnavailable,
@@ -103,6 +106,7 @@ class FakeTickets:
         self.lose_next_create_response = False
         self.reject_creates = False
         self.created_drafts: list[TicketDraft] = []
+        self.comments: list[tuple[str, str]] = []
 
     async def find_by_system_id(self, system_id: uuid.UUID) -> TicketRef | None:
         self.calls.append("find")
@@ -132,7 +136,11 @@ class FakeTickets:
         raise NotImplementedError
 
     async def add_comment(self, key: str, text: str) -> None:
-        raise NotImplementedError
+        self.calls.append("comment")
+        self.comments.append((key, text))
+
+    def ticket_url(self, key: str) -> str:
+        return f"https://jira/browse/{key}"
 
     async def get_ticket(self, key: str):  # type: ignore[no-untyped-def]
         raise NotImplementedError
@@ -633,3 +641,133 @@ async def test_judgement_survives_a_jira_failure(
     assert len(classifier.requests) == 1
     assert len(await _judgements(sessionmaker)) == 1
     assert tickets.created_drafts[-1].urgency == "high"
+
+
+# ---------- assignment rules and Slack notification ----------
+
+
+class FakeSlack:
+    def __init__(self, *errors: Exception) -> None:
+        self.errors = list(errors)
+        self.messages: list[tuple[str, str, list]] = []
+
+    async def post_message(self, channel: str, text: str, blocks: list) -> str:
+        await asyncio.sleep(0.01)  # slow, so overlapping jobs would both get here
+        if self.errors:
+            raise self.errors.pop(0)
+        self.messages.append((channel, text, blocks))
+        return "1.0"
+
+
+SLACK_CONFIG = SlackConfig(
+    default_channel="C-TRIAGE",
+    users={"backend": "U-BE", "frontend": "U-FE", "ops": "U-OPS", "support": "U-SUP"},
+)
+RULES = AssignmentConfig.model_validate(
+    {"rules": [{"name": "Exports go to ops", "when": {"keywords": "export"}, "assign": "ops"}]}
+)
+
+
+def _notifier(slack: FakeSlack, rules: AssignmentConfig = RULES) -> Notifier:
+    return Notifier(
+        slack=slack,  # type: ignore[arg-type]
+        slack_config=SLACK_CONFIG,
+        rules=rules,
+        ticket_url=lambda key: f"https://jira/browse/{key}",
+        public_base_url=BASE_URL,
+    )
+
+
+async def test_rule_overrides_ai_team_and_explains_it_in_a_comment(
+    sessionmaker: async_sessionmaker[AsyncSession], document_id: int
+) -> None:
+    record_id = await _one_record(sessionmaker, document_id)
+    tickets = FakeTickets()
+
+    await push_record(
+        sessionmaker,
+        tickets,
+        record_id,
+        BASE_URL,
+        triage=Triage(FakeClassifier(JUDGEMENT)),
+        rules=RULES,
+    )
+
+    draft = tickets.created_drafts[0]
+    assert (draft.urgency, draft.assignee_role) == ("high", "ops")
+    assert tickets.comments == [
+        ("OPS-1", "Assignment: Rule 'Exports go to ops': team backend -> ops")
+    ]
+    [stored] = await _judgements(sessionmaker)  # the AI's own answer is kept as it was
+    async with sessionmaker() as session:
+        role = await session.scalar(
+            text("SELECT role_name FROM assignee_role WHERE id = :id"),
+            {"id": stored.assignee_role_id},
+        )
+    assert role == "backend"
+
+
+async def _ticketed_record(sessionmaker: async_sessionmaker[AsyncSession], document_id: int) -> int:
+    record_id = await _one_record(sessionmaker, document_id)
+    await push_record(
+        sessionmaker, FakeTickets(), record_id, BASE_URL, triage=Triage(FakeClassifier(JUDGEMENT))
+    )
+    return record_id
+
+
+async def test_notification_mentions_the_final_assignee_once(
+    sessionmaker: async_sessionmaker[AsyncSession], document_id: int
+) -> None:
+    record_id = await _ticketed_record(sessionmaker, document_id)
+    slack = FakeSlack()
+
+    outcomes = await asyncio.gather(
+        *(notify_record(sessionmaker, _notifier(slack), record_id) for _ in range(3))
+    )
+
+    assert sorted(outcomes) == ["already_sent", "already_sent", "sent"]
+    [(channel, fallback, _blocks)] = slack.messages
+    assert channel == "C-TRIAGE"
+    assert fallback == "New ticket OPS-1: Export fails - assigned to <@U-OPS>"
+    assert (await _ticket_sync(sessionmaker, record_id)).notified_at is not None
+
+
+async def test_failed_notification_stays_pending_and_is_offered_again(
+    sessionmaker: async_sessionmaker[AsyncSession], document_id: int
+) -> None:
+    record_id = await _ticketed_record(sessionmaker, document_id)
+    slack = FakeSlack(SlackError("Slack chat.postMessage failed: not_in_channel"))
+
+    with pytest.raises(SlackError):
+        await notify_record(sessionmaker, _notifier(slack), record_id)
+
+    assert (await _ticket_sync(sessionmaker, record_id)).notified_at is None
+    system_id = str((await _records(sessionmaker))[0].system_id)
+    sheet = FakeSheet([HEADER, ["Export fails", "Details", "Alice", "", system_id]])
+    report = await _sync(sessionmaker, sheet).sync_document(document_id)
+    assert report is not None and report.unnotified_record_ids == [record_id]
+
+    assert await notify_record(sessionmaker, _notifier(slack), record_id) == "sent"
+    report = await _sync(sessionmaker, sheet).sync_document(document_id)
+    assert report is not None and report.unnotified_record_ids == []
+
+
+async def test_no_notification_before_the_ticket_exists(
+    sessionmaker: async_sessionmaker[AsyncSession], document_id: int
+) -> None:
+    record_id = await _one_record(sessionmaker, document_id)
+    slack = FakeSlack()
+    assert await notify_record(sessionmaker, _notifier(slack), record_id) == "no_ticket"
+    assert slack.messages == []
+
+
+async def test_without_ai_or_rule_the_channel_is_asked_to_triage(
+    sessionmaker: async_sessionmaker[AsyncSession], document_id: int
+) -> None:
+    record_id = await _one_record(sessionmaker, document_id)
+    await push_record(sessionmaker, FakeTickets(), record_id, BASE_URL)
+    slack = FakeSlack()
+
+    await notify_record(sessionmaker, _notifier(slack, AssignmentConfig()), record_id)
+
+    assert slack.messages[0][1].endswith("needs manual triage")

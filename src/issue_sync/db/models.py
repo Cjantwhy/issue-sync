@@ -284,6 +284,8 @@ class TicketSync(Base):
     pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # When the Slack notification for the new ticket was sent; NULL until then.
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # Inbound from the ticket system
     ticket_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

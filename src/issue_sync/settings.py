@@ -60,6 +60,12 @@ class LlmSettings(_EnvSettings):
     classifier_config_path: Path = Path("config/classifier.yaml")
 
 
+class SlackSettings(_EnvSettings):
+    slack_bot_token: SecretStr = Field(
+        min_length=1, description="Bot token (xoxb-...) of a Slack app with chat:write"
+    )
+
+
 def _valid_poll_interval(seconds: int) -> int:
     # arq cron schedules by second/minute sets, so the interval must divide a minute or an hour.
     if (seconds < 60 and 60 % seconds == 0) or (seconds % 60 == 0 and 60 % (seconds // 60) == 0):
@@ -67,9 +73,10 @@ def _valid_poll_interval(seconds: int) -> int:
     raise ValueError("must divide 60 seconds (e.g. 15, 30) or 60 minutes (e.g. 60, 300, 600)")
 
 
-class Settings(DatabaseSettings, JiraSettings, GoogleSettings, LlmSettings):
+class Settings(DatabaseSettings, JiraSettings, GoogleSettings, LlmSettings, SlackSettings):
     redis_url: str = Field(description="Redis URL used by arq, e.g. redis://redis:6379/0")
     slack_config_path: Path = Path("config/slack.yaml")
+    assignment_config_path: Path = Path("config/assignment.yaml")
     log_level: str = "INFO"
 
     public_base_url: BaseUrl = Field(

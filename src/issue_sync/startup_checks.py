@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from issue_sync.adapter_config import AdapterConfigs, load_adapter_configs
+from issue_sync.adapter_config import AdapterConfigs, AssignmentConfig, load_adapter_configs
 from issue_sync.db.models import (
     AiJudgementType,
     AiJudgementUrgency,
@@ -89,7 +89,28 @@ def check_mappings(constants: InternalConstants, configs: AdapterConfigs) -> Map
             f"{label} maps {key!r}, which is not a value in table {table}"
             for key in sorted(mapping.keys() - values)
         )
+    missing.extend(check_rules(constants, configs.assignment))
     return MappingReport(missing=missing, unknown=unknown)
+
+
+def check_rules(constants: InternalConstants, assignment: AssignmentConfig) -> list[str]:
+    """Every value a rule mentions must exist; a typo would make the rule never match."""
+    problems = []
+    for rule in assignment.rules:
+        refs = [
+            ("when.type", rule.when.type or [], constants.types),
+            ("when.urgency", rule.when.urgency or [], constants.urgencies),
+            ("when.assignee_role", rule.when.assignee_role or [], constants.roles),
+            ("assign", [rule.assign] if rule.assign else [], constants.roles),
+            ("set_urgency", [rule.set_urgency] if rule.set_urgency else [], constants.urgencies),
+        ]
+        problems.extend(
+            f"assignment.yaml: rule {rule.name!r} {field} uses unknown value {value!r}"
+            for field, values, known in refs
+            for value in values
+            if value not in known
+        )
+    return problems
 
 
 def ensure_mappings(constants: InternalConstants, configs: AdapterConfigs) -> None:
@@ -104,7 +125,10 @@ def ensure_mappings(constants: InternalConstants, configs: AdapterConfigs) -> No
 async def run_startup_checks(settings: Settings, engine: AsyncEngine) -> AdapterConfigs:
     """Load adapter configs and verify they cover every internal value. Raises on failure."""
     configs = load_adapter_configs(
-        settings.jira_config_path, settings.slack_config_path, settings.classifier_config_path
+        settings.jira_config_path,
+        settings.slack_config_path,
+        settings.classifier_config_path,
+        settings.assignment_config_path,
     )
     constants = await load_internal_constants(engine)
     ensure_mappings(constants, configs)

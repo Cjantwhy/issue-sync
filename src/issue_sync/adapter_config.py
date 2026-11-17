@@ -9,7 +9,14 @@ from pathlib import Path
 from typing import Annotated, Self
 
 import yaml
-from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    StringConstraints,
+    ValidationError,
+    model_validator,
+)
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
@@ -83,10 +90,52 @@ class ClassifierConfig(_StrictModel):
     guidelines: str | None = None
 
 
+def _as_list(value: object) -> object:
+    return [value] if isinstance(value, str) else value
+
+
+ValueList = Annotated[list[NonEmptyStr], BeforeValidator(_as_list)]
+
+
+class RuleCondition(_StrictModel):
+    """All given conditions must hold. Each list matches if any of its values does."""
+
+    type: ValueList | None = None  # AI category
+    urgency: ValueList | None = None  # AI urgency
+    assignee_role: ValueList | None = None  # AI-suggested team
+    keywords: ValueList | None = None  # substring of title or description, case-insensitive
+    reporter: ValueList | None = None  # exact reporter name, case-insensitive
+
+    @model_validator(mode="after")
+    def _not_empty(self) -> Self:
+        if not any(v for v in self.model_dump().values()):
+            raise ValueError("a rule needs at least one condition")
+        return self
+
+
+class AssignmentRule(_StrictModel):
+    name: NonEmptyStr
+    when: RuleCondition
+    assign: NonEmptyStr | None = None  # assignee_role.role_name
+    set_urgency: NonEmptyStr | None = None  # ai_judgement_urgency.urgency_level_name
+
+    @model_validator(mode="after")
+    def _has_action(self) -> Self:
+        if self.assign is None and self.set_urgency is None:
+            raise ValueError(f"rule {self.name!r} needs `assign` and/or `set_urgency`")
+        return self
+
+
+class AssignmentConfig(_StrictModel):
+    # Checked in order; the first matching rule wins.
+    rules: list[AssignmentRule] = []
+
+
 class AdapterConfigs(_StrictModel):
     jira: JiraConfig
     slack: SlackConfig
     classifier: ClassifierConfig
+    assignment: AssignmentConfig
 
 
 def _load_yaml_model[M: BaseModel](path: Path, model: type[M]) -> M:
@@ -121,11 +170,16 @@ def load_classifier_config(path: Path) -> ClassifierConfig:
     return _load_yaml_model(path, ClassifierConfig)
 
 
+def load_assignment_config(path: Path) -> AssignmentConfig:
+    return _load_yaml_model(path, AssignmentConfig)
+
+
 def load_adapter_configs(
-    jira_path: Path, slack_path: Path, classifier_path: Path
+    jira_path: Path, slack_path: Path, classifier_path: Path, assignment_path: Path
 ) -> AdapterConfigs:
     return AdapterConfigs(
         jira=load_jira_config(jira_path),
         slack=load_slack_config(slack_path),
         classifier=load_classifier_config(classifier_path),
+        assignment=load_assignment_config(assignment_path),
     )

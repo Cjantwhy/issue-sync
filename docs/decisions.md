@@ -212,3 +212,33 @@ One entry per trade-off: context, what was chosen, and why not the alternative.
 ### `issue-sync eval-classifier`
 - **Chosen:** A labelled case file (`eval/triage_cases.yaml`) is run against the real model, and the command reports accuracy per field, accuracy on all three, errors and latency. Urgency is subjective, so a case may list more than one acceptable value. `--min-accuracy` makes it usable as a gate. A unit test checks that every expected value exists in the classifier config.
 - **Caveat:** The 12 bundled cases are hand-written and catch regressions; they are not a benchmark. Real accuracy will come from comparing judgements with human corrections (milestone 8).
+
+## Milestone 5 — Slack notifications and assignment rules
+
+### Schema change: `ticket_sync.notified_at` (approved)
+- **Context:** A notification must not be lost or sent twice, and the final schema had no place to record that it was sent. Without one, a crash between creating the ticket and enqueuing the notification would lose it silently.
+- **Chosen:** A nullable `notified_at TIMESTAMPTZ` on `ticket_sync`, added by migration `0002`. The migration marks tickets that already exist as notified, so deploying it does not send a burst of old notifications.
+- **Not chosen:** Relying on arq's job-id de-duplication alone, which is lost in that crash window. A separate notification table would be more general than one flag needs to be.
+
+### `db/schema.sql` stays the full current schema; migration 0001 is frozen
+- **Chosen:** `db/schema.sql` now includes `notified_at` and remains the readable, authoritative description of the current schema. Migration `0001` runs frozen copies of the original scripts from `migrations/sql/`, so editing `db/schema.sql` never changes history. A test builds a database straight from `db/schema.sql` and compares it with the ORM, and another compares the ORM with the migrated database. Together they keep the file, the migrations and the models in agreement.
+- **Not chosen:** Editing `db/schema.sql` and letting `0001` keep reading it. Fresh and upgraded databases would then reach the same column by different paths, and `0002` would fail on fresh ones.
+
+### Notifications are at-least-once, keyed by `notified_at`
+- **Chosen:** `notify_ticket` locks the `ticket_sync` row, skips if `notified_at` is set, posts to Slack and sets `notified_at` in the same transaction. Concurrent jobs cannot both post. A crash after Slack accepted the message but before the commit repeats it once. Each sync run returns tickets that still have no notification, and the worker re-enqueues them with the fixed job id `notify:<record_id>`. arq ignores an enqueue while such a job is queued, running or its result is kept (one hour), so a misconfigured channel is retried hourly instead of on every poll.
+- **Not chosen:** Sending from inside the push transaction. A slow or failing Slack call would then hold up or fail ticket creation.
+
+### One channel message that mentions the assignee
+- **Chosen:** New tickets are posted to `default_channel` with an `@mention` of the assignee's Slack user (role → user from `slack.yaml`). The team sees the intake, the assignee is notified, and the app only needs `chat:write`. Without an assignee (AI unavailable and no rule matched), the message says the ticket needs manual triage.
+- **Not chosen:** Direct messages, which hide the intake from the team and need more scopes.
+
+### Everything from users or the LLM is escaped for Slack
+- **Chosen:** `&`, `<` and `>` are escaped in titles, reporter names, AI summaries and rule notes. Otherwise a request titled `<!channel>` would ping the whole channel, and `<url|text>` could disguise a link. Verified live with a title containing `<!channel>`.
+
+### Assignment rules: first match wins, AI judgement stored unchanged
+- **Chosen:** `config/assignment.yaml` holds ordered rules. Conditions are the AI's category, urgency or team, keywords in the request, and the reporter. Actions are `assign` (team) and `set_urgency`. The first matching rule decides. Rules only change the ticket's priority and assignee; `ai_judgement` keeps the model's own answer, so AI accuracy can still be measured against human corrections. Keyword and reporter rules also work when there is no AI judgement, which gives a deterministic fallback during an LLM outage. Every value a rule mentions is checked against the database at startup, so a typo cannot silently disable a rule.
+- **Not chosen:** Applying all matching rules in sequence. More expressive, but the result of overlapping rules becomes hard to predict and to explain.
+
+### A rule's effect is explained in a Jira comment, only when it changed something
+- **Chosen:** When a rule changes the team or urgency, a comment such as `Rule 'Month-end close is at least high': urgency low -> high` is added right after creation. It is a comment rather than part of the description because it records a decision made once at creation, while the description is rebuilt on every push. The comment is best effort: if it fails, the push still succeeds. A rule that matches but agrees with the AI writes nothing; the live test showed such "no change" comments are just noise.
+- **Caveat:** The notification job re-evaluates the rules to name the team. If the request or the rules change in the seconds between creation and notification, the message can differ from what the ticket got.

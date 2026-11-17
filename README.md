@@ -13,6 +13,7 @@ cp .env.example .env
 cp config/jira.example.yaml config/jira.yaml
 cp config/slack.example.yaml config/slack.yaml
 cp config/classifier.example.yaml config/classifier.yaml
+cp config/assignment.example.yaml config/assignment.yaml
 # plus the Google service account key in secrets/ (see "Google Sheets setup")
 docker compose up -d --build --wait
 curl localhost:8000/health
@@ -21,7 +22,8 @@ curl localhost:8000/health
 
 `migrate` applies the database migrations and exits. `api` and `worker` start only after it succeeds.
 Both refuse to start if an internal status, category, urgency or role in the database has
-no entry in `config/jira.yaml`, `config/slack.yaml` or `config/classifier.yaml`.
+no entry in `config/jira.yaml`, `config/slack.yaml` or `config/classifier.yaml`, or if an
+assignment rule refers to a value that does not exist.
 
 ## Development
 
@@ -84,6 +86,28 @@ uv run issue-sync eval-classifier                     # per-field accuracy and l
 uv run issue-sync eval-classifier --min-accuracy 0.9  # exit 1 below 90 %
 ```
 
+## Slack notifications and assignment rules
+
+1. Create a Slack app with the bot scope `chat:write`, install it in the workspace and put
+   its bot token (`xoxb-...`) in `.env` as `SLACK_BOT_TOKEN`.
+2. In `config/slack.yaml`, set `default_channel` (channel ID, `C...`) and the Slack member
+   ID (`U...`) for each team. Invite the bot to the channel (`/invite @your-app`).
+3. Copy `config/assignment.example.yaml` to `config/assignment.yaml` and adapt the rules.
+   They adjust the AI's choice of team and urgency, top to bottom, first match wins:
+
+   ```yaml
+   rules:
+     - name: Access requests go to ops
+       when: {type: access_request}
+       assign: ops
+     - name: Month-end close is at least high
+       when: {keywords: [month-end], urgency: [low, medium]}
+       set_urgency: high
+   ```
+
+Each new ticket is posted to the channel with an `@mention` of its assignee, exactly once.
+When a rule changed the AI's choice, the ticket gets a comment saying so.
+
 ## How a row becomes a ticket
 
 1. A trigger or the poll enqueues `sync_document`, which re-reads the worksheet.
@@ -91,7 +115,8 @@ uv run issue-sync eval-classifier --min-accuracy 0.9  # exit 1 below 90 %
 3. Rows whose content changed (SHA-256 of the row, system columns excluded) are saved
    with a `created` or `source_modified` event and marked for a push.
 4. `push_ticket` classifies new requests with the LLM (category, urgency, team, summary,
-   reason), then creates the Jira issue with the mapped priority and assignee, or updates
+   reason), applies the assignment rules, then creates the Jira issue with the mapped
+   priority and assignee, and queues the Slack notification. Or it updates
    the title and description of an existing one. It retries with backoff on transient
    failures. Pushes are serialized per row and look for an existing ticket before
    creating one, so a row never produces two tickets.

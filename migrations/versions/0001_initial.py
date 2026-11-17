@@ -1,7 +1,8 @@
-"""Initial schema: run db/schema.sql then db/extras.sql verbatim.
+"""Initial schema: the original db/schema.sql and db/extras.sql, run verbatim.
 
-The SQL files are the source of truth for the schema; this migration does not
-re-describe them with op.create_table().
+The scripts are frozen copies in migrations/sql/, so this revision never changes when
+db/schema.sql is updated for later revisions. It does not re-describe the schema with
+op.create_table().
 
 Revision ID: 0001
 Revises:
@@ -19,7 +20,7 @@ down_revision: str | None = None
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
-DB_DIR = Path(__file__).resolve().parents[2] / "db"
+SQL_DIR = Path(__file__).resolve().parents[1] / "sql"
 
 # Reverse dependency order.
 TABLES = (
@@ -50,8 +51,8 @@ def _execute_script(sql: str) -> None:
 
 
 def upgrade() -> None:
-    _execute_script((DB_DIR / "schema.sql").read_text(encoding="utf-8"))
-    _execute_script((DB_DIR / "extras.sql").read_text(encoding="utf-8"))
+    _execute_script((SQL_DIR / "0001_schema.sql").read_text(encoding="utf-8"))
+    _execute_script((SQL_DIR / "0001_extras.sql").read_text(encoding="utf-8"))
 
 
 def downgrade() -> None:

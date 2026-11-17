@@ -58,6 +58,8 @@ class SyncReport:
     cells_written: int = 0
     # Records whose ticket_sync is pending: the caller enqueues a push for each.
     pending_record_ids: list[int] = field(default_factory=list)
+    # Records with a ticket but no Slack notification yet: the caller enqueues one each.
+    unnotified_record_ids: list[int] = field(default_factory=list)
 
 
 def detail_url(public_base_url: str, system_id: uuid.UUID) -> str:
@@ -174,6 +176,7 @@ class InboundSync:
         written.update(links)
         await self._mark_written(written)
         report.pending_record_ids = await self._pending_records(document.id)
+        report.unnotified_record_ids = await self._unnotified_records(document.id)
         return report
 
     # ---------- identity ----------
@@ -365,6 +368,18 @@ class InboundSync:
                 .join(DocumentRecord, DocumentRecord.id == TicketSync.document_record_id)
                 .where(DocumentRecord.document_id == document_id)
                 .where(TicketSync.push_status == "pending")
+                .order_by(TicketSync.document_record_id)
+            )
+            return list(rows)
+
+    async def _unnotified_records(self, document_id: int) -> list[int]:
+        """Tickets whose Slack notification was never sent (e.g. its job was lost)."""
+        async with self._sessionmaker() as session:
+            rows = await session.scalars(
+                select(TicketSync.document_record_id)
+                .join(DocumentRecord, DocumentRecord.id == TicketSync.document_record_id)
+                .where(DocumentRecord.document_id == document_id)
+                .where(TicketSync.issue_key.is_not(None), TicketSync.notified_at.is_(None))
                 .order_by(TicketSync.document_record_id)
             )
             return list(rows)
