@@ -12,3 +12,7 @@ users:
   frontend: "U0000000002"
   ops: "U0000000003"
   support: "U0000000004"
+
+# Optional: channel for operational alerts (failed syncs, deleted rows, duplicate ids).
+# Defaults to default_channel.
+# alert_channel: "C0000000009"

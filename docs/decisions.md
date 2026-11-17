@@ -292,3 +292,33 @@ One entry per trade-off: context, what was chosen, and why not the alternative.
 
 ### API docs off by default
 - **Chosen:** `/docs` and `/openapi.json` are served only with `ENABLE_API_DOCS=true`. Once webhooks are reachable from the internet, an endpoint map is information an attacker does not need.
+
+## Milestone 7 — Reconciliation
+
+### One scheduled job repairs what events missed
+- **Context:** Webhooks get lost. In the live test of milestone 6, Cloudflare blocked two of them, and Jira does not retry a 403. Tickets created before baselines existed had no status at all.
+- **Chosen:** A `reconcile` cron job (every 15 minutes, at second 30 so it does not start together with the poll; `issue-sync reconcile` queues one on demand). It applies the same rules as the event path and only records and reports: it returns the worksheets to sync, the pushes to queue and the alerts, and the worker acts on them.
+- **Verified live:** It recovered the two blocked comments, gave seven old tickets a baseline status, and a second run changed nothing.
+
+### Tickets are read in batches by label, comments included
+- **Chosen:** One JQL search per 100 synced records (`labels in (issue-sync-…)`) returns status, priority, assignee, `updated`, summary, description and comments. Comments are fetched separately only for a ticket with more than one page of them. Searching by label means a ticket deleted in Jira is simply missing from the result (and reported), instead of breaking a `key in (…)` query.
+- State is applied only when `updated` is newer than `ticket_updated_at`. Comments are compared on every run, keyed by Jira id, because a missed comment can be older than the watermark.
+- Comments written by the service account are skipped. Those written before the switch to the service account still appear as the person's, since nothing distinguishes them.
+
+### Ticket content edited in Jira is restored; compared as visible text
+- **Chosen:** The sheet owns title and description. If the ticket's summary or description text differs from what the system would push, the record is set back to `pending` with no `pushed_hash`, and the push overwrites it. The description is compared after reducing both sides to plain text: Jira adds attributes such as `localId` to stored ADF, so the JSON never matches exactly.
+- **Verified live:** Six tickets matched exactly. Two older tickets were re-pushed because their description predated the AI triage section, and the next run found nothing to restore, so there is no push loop.
+- Only records whose push status is `success` are compared; a push in progress is not second-guessed.
+
+### Deleted rows are marked by reconciliation, with a guard against mass deletion
+- **Chosen:** A record whose System ID is no longer in its worksheet gets `source_deleted_at` and a `source_deleted` event; its ticket is not touched. A row that comes back (e.g. cut and pasted) is un-marked, with a `source_modified` event whose detail says `{"restored": true}`. This runs only during reconciliation, which holds the same document lock as a sync run, not on every sync, so a row being dragged around for a moment is not deleted.
+- If more than 5 rows and more than half of a worksheet's records would be marked at once, nothing is marked and an alert is sent instead. That pattern means the wrong worksheet, a filter or a broken header far more often than real deletions.
+
+### Duplicate identities are reported, never resolved automatically
+- **Chosen:** A System ID in several rows of a worksheet, or one that belongs to another worksheet, produces an alert naming the rows. Sync keeps using the first row and skipping the others (milestone 3). Clearing the ID of a copied row is left to a person, because picking the wrong row would re-point a ticket.
+
+### Failed work is re-queued until a limit, then handed to a person
+- **Chosen:** Pushes that are `failed` or still `pending` after `RECONCILE_STALE_MINUTES` (30) are re-queued, so they get another full round of arq retries. Once `retry_count` reaches three rounds (`PUSH_MAX_ATTEMPTS × 3`), the push is no longer retried and an alert says so with `last_error`. A ticket still without its Slack notification after the same time is reported too (the poll's sweep keeps retrying it).
+
+### Alerts: one message per run, each problem at most daily
+- **Chosen:** Problems found in one run are posted as one Slack message to `alert_channel` (default: the triage channel), escaped like every other message. Each problem (kind + subject) is posted at most once per 24 hours. The "already posted" marks are Redis keys with a TTL, written only after Slack accepted the message, so a failed post is retried on the next run. Losing Redis costs at most one repeated alert, so no database column is needed. Alerts are also written to the worker log.

@@ -94,6 +94,12 @@ class SlackSettings(_EnvSettings):
     )
 
 
+def _divides_an_hour(minutes: int) -> int:
+    if 1 <= minutes <= 60 and 60 % minutes == 0:
+        return minutes
+    raise ValueError("must divide 60 (e.g. 5, 10, 15, 30, 60)")
+
+
 def _valid_poll_interval(seconds: int) -> int:
     # arq cron schedules by second/minute sets, so the interval must divide a minute or an hour.
     if (seconds < 60 and 60 % seconds == 0) or (seconds % 60 == 0 and 60 % (seconds // 60) == 0):
@@ -123,6 +129,15 @@ class Settings(DatabaseSettings, JiraSettings, GoogleSettings, LlmSettings, Slac
         int, Field(ge=10), AfterValidator(_valid_poll_interval)
     ] = 60
     push_max_attempts: int = Field(default=8, ge=1, description="Ticket push attempts per job")
+    # Reconciliation (missed webhooks, deleted rows, stuck pushes); must divide 60.
+    reconcile_interval_minutes: Annotated[int, AfterValidator(_divides_an_hour)] = 15
+    # Pushes or notifications stuck longer than this are re-queued or reported.
+    reconcile_stale_minutes: int = Field(default=30, ge=5)
+
+    @property
+    def push_retry_limit(self) -> int:
+        """Failed attempts after which reconciliation stops re-queueing a push."""
+        return self.push_max_attempts * 3
 
 
 @lru_cache

@@ -72,6 +72,12 @@ class SlackConfig(_StrictModel):
     default_channel: NonEmptyStr
     # internal assignee role -> Slack user ID
     users: dict[NonEmptyStr, NonEmptyStr]
+    # Operational alerts (failed syncs, deleted rows, duplicates); default_channel if unset.
+    alert_channel: NonEmptyStr | None = None
+
+    @property
+    def alerts_to(self) -> str:
+        return self.alert_channel or self.default_channel
 
 
 class ClassifierConfig(_StrictModel):

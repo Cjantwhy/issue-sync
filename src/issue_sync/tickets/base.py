@@ -86,6 +86,15 @@ class TicketComment(_Model):
     created_at: datetime
 
 
+class TicketReport(TicketSnapshot):
+    """Everything reconciliation compares: state, owned content and comments."""
+
+    system_id: uuid.UUID  # from the ticket's issue-sync label
+    summary: str
+    description_text: str  # the description as plain text
+    comments: list[TicketComment]
+
+
 class TicketEvent(_Model):
     """A change reported by the ticket system's webhook, in internal values."""
 
@@ -169,6 +178,14 @@ class TicketBackend(Protocol):
     async def add_comment(self, key: str, text: str) -> None: ...
 
     async def get_ticket(self, key: str) -> TicketSnapshot: ...
+
+    async def find_tickets(self, system_ids: list[uuid.UUID]) -> list[TicketReport]:
+        """Current state of the tickets tagged with these system_ids (missing ones omitted)."""
+        ...
+
+    def content_matches(self, content: TicketContent, ticket: TicketReport) -> bool:
+        """Whether the ticket still shows exactly the content this system pushed."""
+        ...
 
     async def parse_webhook(self, payload: dict[str, Any]) -> TicketEvent | None:
         """Translate a webhook payload. None for events this system does not track."""

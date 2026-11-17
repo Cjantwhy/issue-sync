@@ -8,6 +8,8 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import httpx
+from arq import create_pool
+from arq.connections import RedisSettings
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -21,7 +23,13 @@ from issue_sync.classify.evaluation import Report, evaluate, load_cases
 from issue_sync.classify.openai_compat import create_classifier
 from issue_sync.db.models import Document, DocumentType
 from issue_sync.db.session import create_engine, create_sessionmaker
-from issue_sync.settings import DatabaseSettings, GoogleSettings, JiraSettings, LlmSettings
+from issue_sync.settings import (
+    DatabaseSettings,
+    GoogleSettings,
+    JiraSettings,
+    LlmSettings,
+    _EnvSettings,
+)
 from issue_sync.sources.sheets.client import create_sheets_client
 from issue_sync.sources.sheets.errors import SheetLayoutError, SheetsError
 from issue_sync.sources.sheets.layout import REQUIRED_HEADERS, DocumentMapping, parse_sheet
@@ -198,6 +206,36 @@ def eval_classifier(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------- reconcile ----------
+
+
+class _QueueSettings(_EnvSettings):
+    redis_url: str
+
+
+async def _enqueue(function: str) -> str | None:
+    redis = await create_pool(RedisSettings.from_dsn(_QueueSettings().redis_url))  # type: ignore[call-arg]
+    try:
+        job = await redis.enqueue_job(function)
+        return job.job_id if job else None
+    finally:
+        await redis.aclose()
+
+
+def reconcile() -> int:
+    """Queue a reconciliation run now instead of waiting for the schedule."""
+    try:
+        job_id = asyncio.run(_enqueue("reconcile"))
+    except ValidationError as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"Error: cannot reach Redis: {exc}", file=sys.stderr)
+        return 2
+    print(f"Reconciliation queued (job {job_id}); the worker log shows the result.")
+    return 0
+
+
 # ---------- entry point ----------
 
 
@@ -233,7 +271,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="0.0-1.0",
         help="Exit with code 1 if fewer cases than this get all three fields right",
     )
+    commands.add_parser(
+        "reconcile", help="Queue a reconciliation run now (missed webhooks, deleted rows, ...)"
+    )
     args = parser.parse_args(argv)
+    if args.command == "reconcile":
+        return reconcile()
     if args.command == "eval-classifier":
         return eval_classifier(args)
     if args.command == "jira-check":

@@ -109,6 +109,10 @@ class InboundSync:
         self._public_base_url = public_base_url
         self._last_unmapped: dict[int, list[str]] = {}
 
+    @property
+    def sheets(self) -> SheetsSource:
+        return self._sheets
+
     async def sync_document(self, document_id: int) -> SyncReport | None:
         """Returns None if the document does not exist or has sync disabled."""
         async with self._sessionmaker() as lock_session, lock_session.begin():

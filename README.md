@@ -129,6 +129,24 @@ Status changes, priority/assignee changes and new comments made in Jira then flo
 the database, and the sheet's Status and Latest note columns are updated. Changes made
 by the service account itself are ignored, so the sync never loops.
 
+## Reconciliation and alerts
+
+Every 15 minutes (`RECONCILE_INTERVAL_MINUTES`) the worker reconciles everything that
+events can miss:
+
+- ticket status, priority, assignee and comments whose webhook never arrived;
+- titles and descriptions edited in Jira, restored from the sheet (the sheet owns them);
+- rows deleted from the sheet: the record is marked deleted, and the ticket is kept;
+- System IDs copied into several rows or worksheets;
+- pushes that failed or got stuck (re-queued, then reported) and missing notifications.
+
+Problems that need a person are posted to Slack (`alert_channel` in `config/slack.yaml`,
+default: `default_channel`), each at most once a day. To run it now:
+
+```bash
+uv run issue-sync reconcile
+```
+
 ## How a row becomes a ticket
 
 1. A trigger or the poll enqueues `sync_document`, which re-reads the worksheet.

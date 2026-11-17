@@ -31,6 +31,7 @@ from issue_sync.sources.sheets.errors import SheetLayoutError
 from issue_sync.sync.inbound import InboundSync
 from issue_sync.sync.notify import Notifier, notify_record
 from issue_sync.sync.push import Triage, push_record
+from issue_sync.sync.reconcile import Reconciler
 from issue_sync.sync.ticket_events import apply_ticket_event
 from issue_sync.tickets.base import (
     TicketBackendUnavailable,
@@ -39,6 +40,7 @@ from issue_sync.tickets.base import (
     TicketDraft,
     TicketEvent,
     TicketRef,
+    TicketReport,
     TicketRequestRejected,
     TicketSnapshot,
     TicketState,
@@ -114,6 +116,9 @@ class FakeTickets:
         self.reject_creates = False
         self.created_drafts: list[TicketDraft] = []
         self.comments: list[tuple[str, str]] = []
+        # What reconciliation sees in Jira, per key: overrides of the reported fields.
+        self.jira_side: dict[str, dict] = {}
+        self.deleted: set[str] = set()
 
     async def find_by_system_id(self, system_id: uuid.UUID) -> TicketRef | None:
         self.calls.append("find")
@@ -164,6 +169,37 @@ class FakeTickets:
 
     async def parse_webhook(self, payload: dict) -> None:
         raise NotImplementedError
+
+    async def find_tickets(self, system_ids: list[uuid.UUID]) -> list[TicketReport]:
+        self.calls.append("find_tickets")
+        reports = []
+        for key, ticket in self.tickets.items():
+            if ticket["system_id"] not in system_ids or key in self.deleted:
+                continue
+            content = ticket["content"]
+            data = {
+                "key": key,
+                "url": self.ticket_url(key),
+                "external_status": "To Do",
+                "status": "open",
+                "priority": "High",
+                "assignee_id": "acc-1",
+                "assignee_name": "Olga Ops",
+                "updated_at": TICKET_CREATED_AT,
+                "system_id": ticket["system_id"],
+                "summary": content.title or "",
+                "description_text": content.description or "",
+                "comments": [],
+                **self.jira_side.get(key, {}),
+            }
+            reports.append(TicketReport(**data))
+        return reports
+
+    def content_matches(self, content: TicketContent, ticket: TicketReport) -> bool:
+        return (ticket.summary, ticket.description_text) == (
+            content.title or "",
+            content.description or "",
+        )
 
 
 # ---------- fixtures ----------
@@ -990,3 +1026,221 @@ async def test_hand_edited_status_cell_is_restored(
 
     assert report is not None and report.cells_written == 1
     assert sheet.cell(2, STATUS_COL) == "Open"
+
+
+# ---------- reconciliation ----------
+
+LATER = TICKET_CREATED_AT + timedelta(hours=1)
+
+
+def _reconciler(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    tickets: FakeTickets,
+    sheet: FakeSheet,
+    *,
+    now: datetime | None = None,
+    retry_limit: int = 24,
+) -> Reconciler:
+    return Reconciler(
+        sessionmaker,
+        tickets,
+        sheet,
+        public_base_url=BASE_URL,
+        service_account_id="acc-bot",
+        retry_limit=retry_limit,
+        clock=lambda: now or datetime.now(UTC),
+    )
+
+
+async def _tracked(
+    sessionmaker: async_sessionmaker[AsyncSession], rows: int = 1
+) -> tuple[int, FakeSheet, FakeTickets, InboundSync]:
+    """A tracked worksheet whose rows all have tickets."""
+    document_id = await _add_document(sessionmaker, worksheet="Tracked", mapping=MAPPING_WB)
+    sheet = FakeSheet([HEADER_WB, *([f"Request {i}", "Details", "Ann"] for i in range(rows))])
+    sync = _sync(sessionmaker, sheet)
+    report = await sync.sync_document(document_id)
+    assert report is not None
+    tickets = FakeTickets()
+    for record_id in report.pending_record_ids:
+        await push_record(sessionmaker, tickets, record_id, BASE_URL)
+    return document_id, sheet, tickets, sync
+
+
+async def test_missed_status_change_and_comments_are_recovered(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    document_id, sheet, tickets, sync = await _tracked(sessionmaker)
+    record_id = (await _records(sessionmaker))[0].id
+    tickets.jira_side["OPS-1"] = {
+        "external_status": "Done",
+        "status": "done",
+        "priority": "Highest",
+        "updated_at": LATER,
+        "comments": [
+            _comment("c1", "Looking into it"),
+            _comment("c2", "Rule comment", hours=1).model_copy(update={"author_id": "acc-bot"}),
+            _comment("c3", "Fixed", hours=2),
+        ],
+    }
+    reconciler = _reconciler(sessionmaker, tickets, sheet)
+
+    first = await reconciler.run()
+    second = await reconciler.run()
+
+    assert (first.tickets_updated, first.comments_added) == (1, 2)
+    assert first.documents_to_sync == {document_id}
+    assert (second.tickets_updated, second.comments_added, second.documents_to_sync) == (
+        0,
+        0,
+        set(),
+    )
+    assert await _status_of(sessionmaker, record_id) == "done"
+    async with sessionmaker() as session:
+        changed = await session.scalar(
+            select(DocumentRecordHistory).where(
+                DocumentRecordHistory.event_type == "status_changed"
+            )
+        )
+    assert changed is not None and changed.created_by == "reconciliation"
+    assert (await _ticket_sync(sessionmaker, record_id)).ticket_updated_at == LATER
+    await sync.sync_document(document_id)
+    assert sheet.cell(2, STATUS_COL) == "Done"
+    assert sheet.cell(2, NOTE_COL) == "2026-11-17 Olga Ops: Fixed"
+
+
+async def test_ticket_without_baseline_gets_one_without_an_event(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    # Tickets created before baselines existed: no status and no watermark yet.
+    _, sheet, tickets, _ = await _tracked(sessionmaker)
+    record_id = (await _records(sessionmaker))[0].id
+    async with sessionmaker() as session, session.begin():
+        await session.execute(text("UPDATE document_record SET status_id = NULL"))
+        await session.execute(text("UPDATE ticket_sync SET ticket_updated_at = NULL"))
+
+    report = await _reconciler(sessionmaker, tickets, sheet).run()
+
+    assert report.tickets_updated == 1
+    assert await _status_of(sessionmaker, record_id) == "open"
+    assert [e for _, e in await _events(sessionmaker)] == ["created"]
+
+
+async def test_content_edited_in_jira_is_queued_for_restore(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    _, sheet, tickets, _ = await _tracked(sessionmaker)
+    record_id = (await _records(sessionmaker))[0].id
+    tickets.jira_side["OPS-1"] = {"summary": "Edited by someone in Jira"}
+
+    report = await _reconciler(sessionmaker, tickets, sheet).run()
+
+    assert (report.content_restored, report.records_to_push) == (1, [record_id])
+    sync = await _ticket_sync(sessionmaker, record_id)
+    assert (sync.push_status, sync.pushed_hash) == ("pending", None)
+    # The push then overwrites Jira with the sheet's version.
+    assert (await push_record(sessionmaker, tickets, record_id, BASE_URL)).outcome == "updated"
+
+
+async def test_ticket_missing_in_jira_is_reported(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    _, sheet, tickets, _ = await _tracked(sessionmaker)
+    tickets.deleted.add("OPS-1")
+
+    report = await _reconciler(sessionmaker, tickets, sheet).run()
+
+    assert [a.kind for a in report.alerts] == ["ticket_missing"]
+
+
+async def test_deleted_row_is_marked_and_a_returned_row_unmarked(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    _, sheet, tickets, _ = await _tracked(sessionmaker, rows=3)
+    removed = sheet.grid.pop(2)  # "Request 1"
+    reconciler = _reconciler(sessionmaker, tickets, sheet)
+
+    report = await reconciler.run()
+
+    assert (report.rows_deleted, report.alerts) == (1, [])
+    records = await _records(sessionmaker)
+    assert [r.source_deleted_at is not None for r in records] == [False, True, False]
+    assert (await _events(sessionmaker))[-1] == (records[1].id, "source_deleted")
+    assert "comment" not in tickets.calls  # the ticket is left alone
+
+    sheet.grid.append(removed)  # pasted back, at another position
+    report = await reconciler.run()
+
+    assert report.rows_restored == 1
+    assert all(r.source_deleted_at is None for r in await _records(sessionmaker))
+    async with sessionmaker() as session:
+        restored = await session.scalar(
+            select(DocumentRecordHistory.detail)
+            .where(DocumentRecordHistory.event_type == "source_modified")
+            .order_by(DocumentRecordHistory.id.desc())
+        )
+    assert restored == {"restored": True}
+
+
+async def test_mass_disappearance_is_reported_not_applied(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    _, sheet, tickets, _ = await _tracked(sessionmaker, rows=7)
+    del sheet.grid[2:]  # 6 of 7 rows gone: a filter or the wrong worksheet, not deletions
+
+    report = await _reconciler(sessionmaker, tickets, sheet).run()
+
+    assert report.rows_deleted == 0
+    assert [a.kind for a in report.alerts] == ["mass_deletion"]
+    assert all(r.source_deleted_at is None for r in await _records(sessionmaker))
+
+
+async def test_duplicate_row_identity_is_reported(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    _, sheet, tickets, _ = await _tracked(sessionmaker)
+    sheet.grid.append(list(sheet.grid[1]))  # a copied row, System ID included
+
+    report = await _reconciler(sessionmaker, tickets, sheet).run()
+
+    [alert] = report.alerts
+    assert alert.kind == "duplicate_identity"
+    assert "rows 2, 3" in alert.message
+
+
+async def test_stuck_pushes_are_requeued_until_the_limit_then_reported(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    _, sheet, tickets, _ = await _tracked(sessionmaker, rows=3)
+    first, second, third = (r.id for r in await _records(sessionmaker))
+    async with sessionmaker() as session, session.begin():
+        await session.execute(text("UPDATE ticket_sync SET notified_at = now()"))
+        await session.execute(
+            text(
+                "UPDATE ticket_sync SET push_status = 'failed', retry_count = 5, "
+                "last_error = 'TicketBackendUnavailable: 503' WHERE document_record_id = :id"
+            ),
+            {"id": first},
+        )
+        await session.execute(
+            text(
+                "UPDATE ticket_sync SET push_status = 'failed', retry_count = 24, "
+                "last_error = 'TicketRequestRejected: bad field' WHERE document_record_id = :id"
+            ),
+            {"id": second},
+        )
+        await session.execute(
+            text("UPDATE ticket_sync SET notified_at = NULL WHERE document_record_id = :id"),
+            {"id": third},
+        )
+    soon = _reconciler(sessionmaker, tickets, sheet)
+    later = _reconciler(sessionmaker, tickets, sheet, now=datetime.now(UTC) + timedelta(hours=1))
+
+    assert (await soon.run()).alerts == []  # nothing is stale yet
+    report = await later.run()
+
+    assert (report.records_to_push, report.pushes_requeued) == ([first], 1)
+    assert sorted((a.kind, a.subject) for a in report.alerts) == [
+        ("notification_missing", "ticket:OPS-3"),
+        ("push_failed", f"record:{second}"),
+    ]

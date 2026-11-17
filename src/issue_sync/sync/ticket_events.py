@@ -22,7 +22,7 @@ from issue_sync.db.models import (
     DocumentRecordStatus,
     TicketSync,
 )
-from issue_sync.tickets.base import TicketEvent, TicketSnapshot, TicketState
+from issue_sync.tickets.base import TicketComment, TicketEvent, TicketSnapshot, TicketState
 
 logger = logging.getLogger(__name__)
 
@@ -136,17 +136,33 @@ async def apply_snapshot(
 async def _add_comment(
     session: AsyncSession, record: DocumentRecord, event: TicketEvent
 ) -> ApplyResult:
-    comment = event.comment
-    assert comment is not None
-    duplicate = await session.scalar(
-        select(DocumentRecordHistory.id).where(
-            DocumentRecordHistory.document_record_id == record.id,
+    assert event.comment is not None
+    if not await add_comment(session, record, event.comment):
+        return ApplyResult("duplicate", record.document_id)
+    return ApplyResult("updated", record.document_id, sheet_changed=True)
+
+
+async def recorded_comment_ids(session: AsyncSession, record_id: int) -> set[str]:
+    rows = await session.scalars(
+        select(DocumentRecordHistory.detail["jira_comment_id"].astext).where(
+            DocumentRecordHistory.document_record_id == record_id,
             DocumentRecordHistory.event_type == "comment",
-            DocumentRecordHistory.detail["jira_comment_id"].astext == comment.id,
         )
     )
-    if duplicate is not None:
-        return ApplyResult("duplicate", record.document_id)
+    return {r for r in rows if r}
+
+
+async def add_comment(
+    session: AsyncSession,
+    record: DocumentRecord,
+    comment: TicketComment,
+    known_ids: set[str] | None = None,
+) -> bool:
+    """Log a ticket comment once (keyed by its Jira id). Returns False if already logged."""
+    known = known_ids if known_ids is not None else await recorded_comment_ids(session, record.id)
+    if comment.id in known:
+        return False
+    known.add(comment.id)
     session.add(
         DocumentRecordHistory(
             document_record_id=record.id,
@@ -157,4 +173,4 @@ async def _add_comment(
             create_time=comment.created_at,  # when it was written in Jira
         )
     )
-    return ApplyResult("updated", record.document_id, sheet_changed=True)
+    return True

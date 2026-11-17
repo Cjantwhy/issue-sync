@@ -18,10 +18,12 @@ from issue_sync.adapter_config import JiraConfig
 from issue_sync.settings import JiraSettings
 from issue_sync.tickets.base import (
     DuplicateTickets,
+    TicketComment,
     TicketContent,
     TicketDraft,
     TicketEvent,
     TicketRef,
+    TicketReport,
     TicketSnapshot,
     TransitionNotAvailable,
     TriageNote,
@@ -37,6 +39,10 @@ SYSTEM_ID_LABEL_PREFIX = "issue-sync-"
 SUMMARY_MAX_LENGTH = 255  # Jira's hard limit
 UNTITLED_SUMMARY = "(untitled request)"
 SNAPSHOT_FIELDS = "status,priority,assignee,updated"
+REPORT_BATCH_SIZE = 100
+REPORT_FIELDS = [
+    "status", "priority", "assignee", "updated", "summary", "description", "labels", "comment",
+]  # fmt: skip
 # An unknown status id reloads the project's statuses at most this often.
 STATUS_RELOAD_SECONDS = 60.0
 FOOTER = (
@@ -50,6 +56,16 @@ _WHITESPACE = re.compile(r"\s+")
 
 def system_id_label(system_id: uuid.UUID) -> str:
     return f"{SYSTEM_ID_LABEL_PREFIX}{system_id}"
+
+
+def _system_id_from_labels(labels: list[str]) -> uuid.UUID | None:
+    for label in labels:
+        if label.startswith(SYSTEM_ID_LABEL_PREFIX):
+            try:
+                return uuid.UUID(label.removeprefix(SYSTEM_ID_LABEL_PREFIX))
+            except ValueError:
+                continue
+    return None
 
 
 def build_summary(title: str | None) -> str:
@@ -213,6 +229,84 @@ class JiraBackend:
                 f"Several Jira issues carry label {system_id_label(system_id)}: {', '.join(keys)}"
             )
         return self._ref(keys[0]) if keys else None
+
+    async def find_tickets(self, system_ids: list[uuid.UUID]) -> list[TicketReport]:
+        """Batch lookup by system_id label, REPORT_BATCH_SIZE labels per search.
+
+        Searching by label rather than by key means a ticket deleted in Jira is simply
+        absent from the result, instead of failing the whole JQL query.
+        """
+        reports: list[TicketReport] = []
+        for start in range(0, len(system_ids), REPORT_BATCH_SIZE):
+            batch = system_ids[start : start + REPORT_BATCH_SIZE]
+            labels = ", ".join(f'"{system_id_label(sid)}"' for sid in batch)
+            jql = f'project = "{self._config.project_key}" AND labels in ({labels})'
+            token: str | None = None
+            while True:
+                body: dict[str, Any] = {
+                    "jql": jql,
+                    "fields": REPORT_FIELDS,
+                    "maxResults": REPORT_BATCH_SIZE,
+                }
+                if token:
+                    body["nextPageToken"] = token
+                page = await self._client.request("POST", "/search/jql", json=body)
+                for issue in page.get("issues") or []:
+                    report = await self._report(issue)
+                    if report is not None:
+                        reports.append(report)
+                token = page.get("nextPageToken")
+                if page.get("isLast", True) or not token:
+                    break
+        return reports
+
+    async def _report(self, issue: dict[str, Any]) -> TicketReport | None:
+        fields = issue["fields"]
+        system_id = _system_id_from_labels(fields.get("labels") or [])
+        if system_id is None:
+            return None
+        comment_field = fields.get("comment") or {}
+        raw_comments = list(comment_field.get("comments") or [])
+        if comment_field.get("total", 0) > len(raw_comments):
+            raw_comments = [
+                c
+                async for c in self._client.paginate(
+                    _issue_path(issue["key"], "/comment"), items_key="comments"
+                )
+            ]
+        status = fields["status"]["name"]
+        priority = fields.get("priority") or {}
+        assignee = fields.get("assignee") or {}
+        return TicketReport(
+            key=issue["key"],
+            url=self._client.browse_url(issue["key"]),
+            external_status=status,
+            status=self._config.internal_status_for(status),
+            priority=priority.get("name"),
+            assignee_id=assignee.get("accountId"),
+            assignee_name=assignee.get("displayName"),
+            updated_at=datetime.fromisoformat(fields["updated"]),
+            system_id=system_id,
+            summary=fields.get("summary") or "",
+            description_text=adf.to_plain_text(fields.get("description")),
+            comments=[
+                TicketComment(
+                    id=str(c["id"]),
+                    author_id=(c.get("author") or {}).get("accountId"),
+                    author_name=(c.get("author") or {}).get("displayName"),
+                    text=adf.to_plain_text(c.get("body")),
+                    created_at=datetime.fromisoformat(c["created"]),
+                )
+                for c in raw_comments
+            ],
+        )
+
+    def content_matches(self, content: TicketContent, ticket: TicketReport) -> bool:
+        # Compared as plain text: Jira adds attributes (e.g. localId) to stored ADF, so
+        # the JSON never round-trips exactly, while the visible text does.
+        return ticket.summary == build_summary(content.title) and (
+            ticket.description_text == adf.to_plain_text(build_description(content))
+        )
 
     async def update_content(self, key: str, content: TicketContent) -> None:
         fields = {

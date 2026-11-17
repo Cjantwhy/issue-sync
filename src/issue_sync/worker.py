@@ -10,9 +10,12 @@ Jobs:
 - `notify_ticket`: Slack message for a new ticket, sent once (ticket_sync.notified_at).
 - `ticket_event`: a Jira webhook event -> database; enqueues `sync_document` to write
   the new status or latest note back to the sheet.
+- `reconcile` (cron): repair missed webhooks, edited ticket content, deleted rows and
+  stuck pushes; alert on what needs an operator.
 """
 
 import logging
+from datetime import timedelta
 from typing import Any, ClassVar
 
 import httpx
@@ -24,6 +27,7 @@ from issue_sync.classify.openai_compat import create_classifier
 from issue_sync.db.models import Document
 from issue_sync.db.session import create_engine, create_sessionmaker
 from issue_sync.log_setup import configure_logging
+from issue_sync.notify.alerts import Alerter, RedisAlertMarks
 from issue_sync.notify.slack import SlackError, create_slack_client
 from issue_sync.settings import Settings, get_settings
 from issue_sync.sources.sheets.client import create_sheets_client
@@ -32,6 +36,7 @@ from issue_sync.startup_checks import run_startup_checks
 from issue_sync.sync.inbound import InboundSync
 from issue_sync.sync.notify import Notifier, notify_record
 from issue_sync.sync.push import Triage, push_record
+from issue_sync.sync.reconcile import Reconciler
 from issue_sync.sync.retry import poll_schedule, retry_delay
 from issue_sync.sync.ticket_events import apply_ticket_event
 from issue_sync.tickets.base import TicketBackendError
@@ -73,8 +78,19 @@ async def startup(ctx: dict[str, Any]) -> None:
             sessionmaker, create_sheets_client(settings, http), str(settings.public_base_url)
         ),
     )
+    slack = create_slack_client(settings, http)
+    ctx["reconciler"] = Reconciler(
+        sessionmaker,
+        ctx["ticket_backend"],
+        ctx["inbound"].sheets,
+        public_base_url=str(settings.public_base_url),
+        service_account_id=configs.jira.service_account_id,
+        retry_limit=settings.push_retry_limit,
+        stale_after=timedelta(minutes=settings.reconcile_stale_minutes),
+    )
+    ctx["alerter"] = Alerter(slack, configs.slack.alerts_to, RedisAlertMarks(ctx["redis"]))
     ctx["notifier"] = Notifier(
-        slack=create_slack_client(settings, http),
+        slack=slack,
         slack_config=configs.slack,
         rules=configs.assignment,
         ticket_url=ctx["ticket_backend"].ticket_url,
@@ -213,6 +229,22 @@ async def ticket_event(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
     return result.outcome
 
 
+async def reconcile(ctx: dict[str, Any]) -> dict[str, int]:
+    report = await ctx["reconciler"].run()
+    for document_id in sorted(report.documents_to_sync):
+        await ctx["redis"].enqueue_job("sync_document", document_id)
+    for record_id in report.records_to_push:
+        await ctx["redis"].enqueue_job("push_ticket", record_id)
+    for alert in report.alerts:
+        logger.warning("alert %s (%s): %s", alert.kind, alert.subject, alert.message)
+    try:
+        await ctx["alerter"].send(report.alerts)
+    except SlackError as exc:
+        # The alerts are in the log above; they are posted on the next run.
+        logger.error("could not post alerts to Slack: %s", exc)
+    return report.summary()
+
+
 class WorkerSettings:
     functions: ClassVar[list[Any]] = [
         ping,
@@ -220,13 +252,21 @@ class WorkerSettings:
         func(push_ticket, max_tries=get_settings().push_max_attempts),
         func(notify_ticket, max_tries=NOTIFY_MAX_TRIES),
         func(ticket_event, max_tries=TICKET_EVENT_MAX_TRIES),
+        func(reconcile, max_tries=1, timeout=600),
     ]
     cron_jobs: ClassVar[list[Any]] = [
         cron(
             poll_documents,
             run_at_startup=True,
             **poll_schedule(get_settings().sheets_poll_interval_seconds),  # type: ignore[arg-type]
-        )
+        ),
+        # Offset from the poll (second 0) so the two do not start together.
+        cron(
+            reconcile,
+            minute=set(range(0, 60, get_settings().reconcile_interval_minutes)),
+            second=30,
+            timeout=600,
+        ),
     ]
     on_startup = startup
     on_shutdown = shutdown
