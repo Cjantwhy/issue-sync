@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
-from pydantic import AfterValidator, AnyHttpUrl, Field, SecretStr
+from pydantic import AfterValidator, AnyHttpUrl, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,10 +31,38 @@ class DatabaseSettings(_EnvSettings):
 
 
 class JiraSettings(_EnvSettings):
-    jira_base_url: BaseUrl = Field(description="e.g. https://your-domain.atlassian.net")
-    jira_email: str = Field(description="Email of the Atlassian account that owns the API token")
-    jira_api_token: SecretStr
+    """Two ways to authenticate:
+
+    - basic: an Atlassian account's email + API token, calling the site directly.
+    - oauth: a service account's OAuth 2.0 client credentials, calling the
+      api.atlassian.com gateway for `jira_cloud_id` (service accounts have no email).
+    """
+
+    jira_base_url: BaseUrl = Field(description="Site URL, e.g. https://your-domain.atlassian.net")
+    jira_auth: Literal["basic", "oauth"] = "basic"
+    jira_email: str | None = None
+    jira_api_token: SecretStr | None = None
+    jira_client_id: str | None = None
+    jira_client_secret: SecretStr | None = None
+    jira_cloud_id: str | None = None
     jira_config_path: Path = Path("config/jira.yaml")
+
+    @model_validator(mode="after")
+    def _credentials_for_auth_mode(self) -> "JiraSettings":
+        required = {
+            "basic": ("jira_email", "jira_api_token"),
+            "oauth": ("jira_client_id", "jira_client_secret", "jira_cloud_id"),
+        }[self.jira_auth]
+        missing = []
+        for name in required:
+            value = getattr(self, name)
+            if isinstance(value, SecretStr):
+                value = value.get_secret_value()
+            if not value:
+                missing.append(name.upper())
+        if missing:
+            raise ValueError(f"JIRA_AUTH={self.jira_auth} requires {', '.join(missing)}")
+        return self
 
 
 class GoogleSettings(_EnvSettings):
@@ -85,6 +113,12 @@ class Settings(DatabaseSettings, JiraSettings, GoogleSettings, LlmSettings, Slac
     sheets_webhook_secret: SecretStr = Field(
         min_length=16, description="Shared secret the Apps Script trigger sends"
     )
+    jira_webhook_secret: SecretStr = Field(
+        min_length=16, description="Secret of the Jira admin webhook; Jira signs bodies with it"
+    )
+    # Interactive API docs (/docs, /openapi.json). Off by default: they describe every
+    # endpoint to anyone who can reach the api.
+    enable_api_docs: bool = False
     sheets_poll_interval_seconds: Annotated[
         int, Field(ge=10), AfterValidator(_valid_poll_interval)
     ] = 60

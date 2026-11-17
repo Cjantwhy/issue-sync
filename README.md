@@ -108,6 +108,27 @@ uv run issue-sync eval-classifier --min-accuracy 0.9  # exit 1 below 90 %
 Each new ticket is posted to the channel with an `@mention` of its assignee, exactly once.
 When a rule changed the AI's choice, the ticket gets a comment saying so.
 
+## Jira service account and webhook
+
+1. In Atlassian Administration > Directory > Service accounts, create a service account
+   with the Jira role **User**, and add it to the project as a member.
+2. Create an **OAuth 2.0** credential for it with the scopes `read:jira-work`,
+   `write:jira-work` and `read:jira-user`. Put the client id and secret in `.env`
+   (`JIRA_AUTH=oauth`, `JIRA_CLIENT_ID`, `JIRA_CLIENT_SECRET`) together with the site's
+   cloud id (`JIRA_CLOUD_ID`; `https://<site>/_edge/tenant_info` shows it).
+3. Run `uv run issue-sync jira-check`. Its first check prints the service account's
+   accountId: put it in `config/jira.yaml` as `service_account_id`. Names in `jira.yaml`
+   (issue type, statuses) must be the ones the service account sees, which may be English
+   even on a site in another language.
+4. In Jira, Settings > System > WebHooks > Create a WebHook:
+   - URL: `https://<public host>/webhooks/jira`
+   - Secret: the value of `JIRA_WEBHOOK_SECRET`
+   - Events: Issue **updated**, Comment **created**; JQL: `project = <KEY>`
+
+Status changes, priority/assignee changes and new comments made in Jira then flow back to
+the database, and the sheet's Status and Latest note columns are updated. Changes made
+by the service account itself are ignored, so the sync never loops.
+
 ## How a row becomes a ticket
 
 1. A trigger or the poll enqueues `sync_document`, which re-reads the worksheet.

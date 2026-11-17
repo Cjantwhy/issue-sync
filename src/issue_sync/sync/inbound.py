@@ -18,10 +18,17 @@ from typing import Protocol
 
 from pydantic import ValidationError
 from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import distinct_on
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from issue_sync.db.models import Document, DocumentRecord, DocumentRecordHistory, TicketSync
+from issue_sync.db.models import (
+    Document,
+    DocumentRecord,
+    DocumentRecordHistory,
+    DocumentRecordStatus,
+    TicketSync,
+)
 from issue_sync.sources.sheets.client import CellWrite
 from issue_sync.sources.sheets.errors import SheetLayoutError
 from issue_sync.sources.sheets.layout import (
@@ -64,6 +71,21 @@ class SyncReport:
 
 def detail_url(public_base_url: str, system_id: uuid.UUID) -> str:
     return f"{public_base_url.rstrip('/')}/r/{system_id}"
+
+
+NOTE_MAX_LENGTH = 500
+
+
+def status_label(status_name: str | None) -> str:
+    """Internal status as shown in the sheet: in_progress -> "In progress"."""
+    return status_name.replace("_", " ").capitalize() if status_name else ""
+
+
+def latest_note(text: str | None, author: str, created: datetime) -> str:
+    """The newest ticket comment, on one line: "2026-11-17 Olga: Fixed in 1.4"."""
+    body = " ".join((text or "").split())
+    note = f"{created.astimezone(UTC):%Y-%m-%d} {author}: {body}"
+    return note if len(note) <= NOTE_MAX_LENGTH else note[: NOTE_MAX_LENGTH - 1] + "…"
 
 
 def record_values(row: SheetRow) -> dict[str, str | None]:
@@ -171,9 +193,9 @@ class InboundSync:
         for system_id, row in identified.items():
             await self._upsert(document, system_id, row, report)
 
-        links = await self._fix_links(document, layout, identified, written)
-        report.cells_written += len(links)
-        written.update(links)
+        fixed, count = await self._fix_system_cells(document, layout, identified, written)
+        report.cells_written += count
+        written.update(fixed)
         await self._mark_written(written)
         report.pending_record_ids = await self._pending_records(document.id)
         report.unnotified_record_ids = await self._unnotified_records(document.id)
@@ -232,30 +254,80 @@ class InboundSync:
             "detail_url": detail_url(self._public_base_url, system_id),
         }
 
-    async def _fix_links(
+    async def _fix_system_cells(
         self,
         document: Document,
         layout: SheetLayout,
         identified: dict[uuid.UUID, SheetRow],
         already_written: dict[uuid.UUID, dict[str, str]],
-    ) -> dict[uuid.UUID, dict[str, str]]:
-        """Rewrite detail links that are missing or were edited by hand.
+    ) -> tuple[dict[uuid.UUID, dict[str, str]], int]:
+        """Make the system-owned columns match the database: detail link, status and
+        latest note. Covers both new values from Jira and cells edited by hand.
 
-        Unlike ids, links are not re-verified before writing: if rows shift meanwhile,
-        a wrong link is corrected by the next run, and no identity is touched.
+        Unlike ids, these are not re-verified before writing: if rows shift meanwhile,
+        a wrong cell is corrected by the next run, and no identity is touched.
+        Returns the expected cells per written record and the number of cells written.
         """
+        pending = [sid for sid in identified if sid not in already_written]
+        expected_by_id = await self._expected_system_cells(document.id, layout, pending)
         cells, written = [], {}
-        for system_id, row in identified.items():
-            if system_id in already_written:
-                continue
-            expected = self._system_cells(system_id)
-            if row.detail_url_cell != expected["detail_url"]:
-                cells.append(
-                    CellWrite(row.row_number, layout.columns["detail_url"], expected["detail_url"])
-                )
+        for system_id, expected in expected_by_id.items():
+            row = identified[system_id]
+            stale = [f for f, value in expected.items() if row.system_cells.get(f, "") != value]
+            if stale:
+                cells += [CellWrite(row.row_number, layout.columns[f], expected[f]) for f in stale]
                 written[system_id] = expected
         await self._sheets.write_cells(document.spreadsheet_id, document.worksheet_name, cells)
-        return written
+        return written, len(cells)
+
+    async def _expected_system_cells(
+        self, document_id: int, layout: SheetLayout, system_ids: list[uuid.UUID]
+    ) -> dict[uuid.UUID, dict[str, str]]:
+        if not system_ids:
+            return {}
+        async with self._sessionmaker() as session:
+            records = (
+                await session.execute(
+                    select(
+                        DocumentRecord.id,
+                        DocumentRecord.system_id,
+                        DocumentRecordStatus.status_name,
+                    )
+                    .outerjoin(
+                        DocumentRecordStatus, DocumentRecordStatus.id == DocumentRecord.status_id
+                    )
+                    .where(DocumentRecord.document_id == document_id)
+                    .where(DocumentRecord.system_id.in_(system_ids))
+                )
+            ).all()
+            notes: dict[int, str] = {}
+            if "latest_note" in layout.columns and records:
+                rows = await session.execute(
+                    select(
+                        DocumentRecordHistory.document_record_id,
+                        DocumentRecordHistory.comment,
+                        DocumentRecordHistory.created_by,
+                        DocumentRecordHistory.create_time,
+                    )
+                    .where(DocumentRecordHistory.event_type == "comment")
+                    .where(DocumentRecordHistory.document_record_id.in_([r.id for r in records]))
+                    .order_by(
+                        DocumentRecordHistory.document_record_id,
+                        DocumentRecordHistory.create_time.desc(),
+                        DocumentRecordHistory.id.desc(),
+                    )
+                    .ext(distinct_on(DocumentRecordHistory.document_record_id))
+                )
+                notes = {r[0]: latest_note(r[1], r[2], r[3]) for r in rows}
+        expected: dict[uuid.UUID, dict[str, str]] = {}
+        for record_id, system_id, status_name in records:
+            cells = self._system_cells(system_id)
+            if "status" in layout.columns:
+                cells["status"] = status_label(status_name)
+            if "latest_note" in layout.columns:
+                cells["latest_note"] = notes.get(record_id, "")
+            expected[system_id] = cells
+        return expected
 
     async def _mark_written(self, written: dict[uuid.UUID, dict[str, str]]) -> None:
         if not written:

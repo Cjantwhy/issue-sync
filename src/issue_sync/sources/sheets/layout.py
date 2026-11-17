@@ -65,6 +65,7 @@ class SheetRow:
     fields: dict[str, str | None]  # sheet-owned fields, None when blank
     system_id_cell: str
     detail_url_cell: str
+    system_cells: dict[str, str]  # every mapped system field -> its current cell value
     raw: dict[str, str]  # the whole row, keyed by header
     raw_hash: str  # SHA-256 of the row without system-owned columns
     has_content: bool  # any non-empty cell outside the system-owned columns
@@ -136,6 +137,7 @@ def parse_sheet(values: list[list[str]], mapping: DocumentMapping) -> SheetLayou
                 },
                 system_id_cell=padded[columns["system_id"]],
                 detail_url_cell=padded[columns["detail_url"]],
+                system_cells={f: padded[columns[f]] for f in SYSTEM_FIELDS if f in columns},
                 raw=raw,
                 raw_hash=content_hash(content),
                 has_content=any(content.values()),

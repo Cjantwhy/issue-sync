@@ -5,10 +5,14 @@ Field ownership: summary and description are owned by the spreadsheet and overwr
 every update; priority and assignee are set once at creation and owned by Jira after that.
 """
 
+import asyncio
 import re
+import time
 import uuid
 from datetime import datetime
 from typing import Any
+
+import httpx
 
 from issue_sync.adapter_config import JiraConfig
 from issue_sync.settings import JiraSettings
@@ -16,13 +20,16 @@ from issue_sync.tickets.base import (
     DuplicateTickets,
     TicketContent,
     TicketDraft,
+    TicketEvent,
     TicketRef,
     TicketSnapshot,
     TransitionNotAvailable,
     TriageNote,
 )
 from issue_sync.tickets.jira import adf
+from issue_sync.tickets.jira.auth import OAuthClientCredentials, gateway_url
 from issue_sync.tickets.jira.client import JiraClient
+from issue_sync.tickets.jira.webhook import parse_jira_webhook
 
 # Every ticket is labelled with its record's system_id so a create that timed out (but
 # succeeded in Jira) can be found again instead of creating a duplicate.
@@ -30,6 +37,8 @@ SYSTEM_ID_LABEL_PREFIX = "issue-sync-"
 SUMMARY_MAX_LENGTH = 255  # Jira's hard limit
 UNTITLED_SUMMARY = "(untitled request)"
 SNAPSHOT_FIELDS = "status,priority,assignee,updated"
+# An unknown status id reloads the project's statuses at most this often.
+STATUS_RELOAD_SECONDS = 60.0
 FOOTER = (
     "Synced from Google Sheets by issue-sync. The title and description are owned by "
     "the sheet; edits made here will be overwritten."
@@ -129,9 +138,42 @@ class JiraBackend:
     def __init__(self, client: JiraClient, config: JiraConfig) -> None:
         self._client = client
         self._config = config
+        self._status_names: dict[str, str] = {}  # status id -> name (service account view)
+        self._statuses_loaded_at = float("-inf")
+        self._status_lock = asyncio.Lock()
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def parse_webhook(self, payload: dict[str, Any]) -> TicketEvent | None:
+        return await parse_jira_webhook(payload, self._config, self._resolve_status)
+
+    async def _resolve_status(self, status: dict[str, Any]) -> tuple[str | None, str]:
+        """Map a webhook status by id, not by name.
+
+        Names are localized: a webhook may carry the site language's name while
+        jira.yaml uses the names the service account sees. Ids are stable, so the
+        project's statuses are loaded once (as the service account) and looked up by id.
+        """
+        status_id = str(status.get("id") or "")
+        if status_id and status_id not in self._status_names:
+            # Concurrent events wait for one load instead of falling back to the
+            # payload's (possibly localized) name while it is in flight.
+            async with self._status_lock:
+                now = time.monotonic()
+                if (
+                    status_id not in self._status_names
+                    and now - self._statuses_loaded_at > STATUS_RELOAD_SECONDS
+                ):
+                    per_type = await self._client.request(
+                        "GET", f"/project/{self._config.project_key}/statuses"
+                    )
+                    for issue_type in per_type or []:
+                        for item in issue_type.get("statuses") or []:
+                            self._status_names[str(item["id"])] = item["name"]
+                    self._statuses_loaded_at = now
+        name = self._status_names.get(status_id) or str(status.get("name") or "")
+        return self._config.internal_status_for(name), name
 
     def ticket_url(self, key: str) -> str:
         _issue_path(key)  # validates the key
@@ -231,10 +273,19 @@ class JiraBackend:
 
 
 def create_jira_client(settings: JiraSettings) -> JiraClient:
+    site = str(settings.jira_base_url)
+    if settings.jira_auth == "oauth":
+        assert settings.jira_client_id and settings.jira_client_secret and settings.jira_cloud_id
+        return JiraClient(
+            site,
+            OAuthClientCredentials(
+                settings.jira_client_id, settings.jira_client_secret.get_secret_value()
+            ),
+            api_base_url=gateway_url(settings.jira_cloud_id),
+        )
+    assert settings.jira_email and settings.jira_api_token
     return JiraClient(
-        str(settings.jira_base_url),
-        settings.jira_email,
-        settings.jira_api_token.get_secret_value(),
+        site, httpx.BasicAuth(settings.jira_email, settings.jira_api_token.get_secret_value())
     )
 
 

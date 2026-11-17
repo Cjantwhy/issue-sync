@@ -31,6 +31,7 @@ from issue_sync.db.models import (
 from issue_sync.rules import RequestFacts, decide
 from issue_sync.sources.sheets.layout import content_hash
 from issue_sync.sync.inbound import detail_url
+from issue_sync.sync.ticket_events import apply_snapshot
 from issue_sync.tickets.base import (
     TicketBackend,
     TicketBackendError,
@@ -145,6 +146,8 @@ async def push_record(
         except (TicketBackendError, ValueError) as exc:
             return _failed(sync, record_id, exc)
 
+        if outcome in ("created", "linked"):
+            await _baseline(session, backend, record, sync)
         sync.push_status = "success"
         sync.pushed_hash = pushed_hash
         sync.pushed_at = datetime.now(UTC)
@@ -173,6 +176,24 @@ async def _explain_rule(backend: TicketBackend, key: str, explanation: str | Non
         await backend.add_comment(key, f"Assignment: {explanation}")
     except (TicketBackendError, ValueError) as exc:
         logger.warning("could not comment the assignment rule on %s: %s", key, exc)
+
+
+async def _baseline(
+    session: AsyncSession, backend: TicketBackend, record: DocumentRecord, sync: TicketSync
+) -> None:
+    """Read the new ticket's status, priority and assignee into the record.
+
+    Gives the sheet an initial status right away and sets `ticket_updated_at`, the
+    watermark that later webhook events are compared with. Best effort: the ticket
+    exists, so a failure here must not fail the push; the next event fills it in.
+    """
+    assert sync.issue_key is not None
+    try:
+        snapshot = await backend.get_ticket(sync.issue_key)
+    except (TicketBackendError, ValueError) as exc:
+        logger.warning("could not read back %s after creating it: %s", sync.issue_key, exc)
+        return
+    await apply_snapshot(session, record, sync, snapshot)
 
 
 def _failed(sync: TicketSync, record_id: int, exc: Exception) -> PushResult:

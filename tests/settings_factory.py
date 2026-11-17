@@ -15,6 +15,7 @@ REQUIRED: dict[str, Any] = {
     "llm_model": "test-model",
     "llm_api_key": "llm-key",
     "slack_bot_token": "xoxb-test",
+    "jira_webhook_secret": "j" * 32,
 }
 
 

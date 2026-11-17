@@ -73,3 +73,46 @@ def plain_text_paragraphs(value: str) -> list[Node]:
         if any(node["type"] == "text" for node in inline):
             blocks.append(paragraph(*inline))
     return blocks
+
+
+_BLOCK_TYPES = {"paragraph", "heading", "blockquote", "codeBlock", "rule", "panel"}
+
+
+def to_plain_text(node: object) -> str:
+    """Readable plain text from an ADF document (comments written in Jira).
+
+    Formatting is dropped; mentions keep their display text, links their URL, and
+    attachments become "[attachment]". Blocks are separated by newlines.
+    """
+    parts: list[str] = []
+
+    def walk(n: object) -> None:
+        if isinstance(n, list):
+            for child in n:
+                walk(child)
+            return
+        if not isinstance(n, dict):
+            return
+        kind = n.get("type")
+        attrs = n.get("attrs") or {}
+        if kind == "text":
+            parts.append(str(n.get("text", "")))
+        elif kind == "hardBreak":
+            parts.append("\n")
+        elif kind == "mention":
+            parts.append(str(attrs.get("text") or "@user"))
+        elif kind == "emoji":
+            parts.append(str(attrs.get("text") or attrs.get("shortName") or ""))
+        elif kind in ("inlineCard", "blockCard"):
+            parts.append(str(attrs.get("url") or ""))
+        elif kind in ("media", "mediaInline"):
+            parts.append("[attachment]")
+        if kind == "listItem":
+            parts.append("- ")
+        walk(n.get("content") or [])
+        if kind in _BLOCK_TYPES:
+            parts.append("\n")
+
+    walk(node)
+    lines = [line.rstrip() for line in "".join(parts).split("\n")]
+    return "\n".join(lines).strip()

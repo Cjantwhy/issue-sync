@@ -8,6 +8,7 @@ import asyncio
 import copy
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from alembic import command
@@ -30,18 +31,24 @@ from issue_sync.sources.sheets.errors import SheetLayoutError
 from issue_sync.sync.inbound import InboundSync
 from issue_sync.sync.notify import Notifier, notify_record
 from issue_sync.sync.push import Triage, push_record
+from issue_sync.sync.ticket_events import apply_ticket_event
 from issue_sync.tickets.base import (
     TicketBackendUnavailable,
+    TicketComment,
     TicketContent,
     TicketDraft,
+    TicketEvent,
     TicketRef,
     TicketRequestRejected,
+    TicketSnapshot,
+    TicketState,
 )
 from tests.db_fixtures import alembic_config, integration, throwaway_database
 
 pytestmark = integration
 
 BASE_URL = "https://sync.example.com"
+TICKET_CREATED_AT = datetime(2026, 11, 17, 9, 0, tzinfo=UTC)
 HEADER = ["Title", "Description", "Reporter", "Team", "System ID", "Detail link"]
 MAPPING = {
     "title": "Title",
@@ -142,7 +149,20 @@ class FakeTickets:
     def ticket_url(self, key: str) -> str:
         return f"https://jira/browse/{key}"
 
-    async def get_ticket(self, key: str):  # type: ignore[no-untyped-def]
+    async def get_ticket(self, key: str) -> TicketSnapshot:
+        self.calls.append("get")
+        return TicketSnapshot(
+            key=key,
+            url=self.ticket_url(key),
+            external_status="To Do",
+            status="open",
+            priority="High",
+            assignee_id="acc-1",
+            assignee_name="Olga Ops",
+            updated_at=TICKET_CREATED_AT,
+        )
+
+    async def parse_webhook(self, payload: dict) -> None:
         raise NotImplementedError
 
 
@@ -173,7 +193,10 @@ async def sessionmaker(migrated_url: str) -> AsyncIterator[async_sessionmaker[As
 
 
 async def _add_document(
-    sessionmaker: async_sessionmaker[AsyncSession], worksheet: str = "Requests", **extra: object
+    sessionmaker: async_sessionmaker[AsyncSession],
+    worksheet: str = "Requests",
+    mapping: dict[str, str] = MAPPING,
+    **extra: object,
 ) -> int:
     async with sessionmaker() as session, session.begin():
         type_id = await session.scalar(text("SELECT id FROM document_type LIMIT 1"))
@@ -182,7 +205,7 @@ async def _add_document(
             name=worksheet,
             spreadsheet_id="1AbC",
             worksheet_name=worksheet,
-            mapping=MAPPING,
+            mapping=mapping,
             **extra,
         )
         session.add(document)
@@ -446,7 +469,7 @@ async def test_push_creates_then_skips_then_updates(
     updated = await push_record(sessionmaker, tickets, record_id, BASE_URL)
 
     assert (created.outcome, again.outcome, updated.outcome) == ("created", "unchanged", "updated")
-    assert tickets.calls == ["find", "create", "update"]
+    assert tickets.calls == ["find", "create", "get", "update"]
     draft = tickets.tickets["OPS-1"]["content"]
     assert draft.title == "Export fails (CSV)"
     sync = await _ticket_sync(sessionmaker, record_id)
@@ -771,3 +794,199 @@ async def test_without_ai_or_rule_the_channel_is_asked_to_triage(
     await notify_record(sessionmaker, _notifier(slack, AssignmentConfig()), record_id)
 
     assert slack.messages[0][1].endswith("needs manual triage")
+
+
+# ---------- Jira events -> database -> sheet ----------
+
+HEADER_WB = [*HEADER, "Status", "Latest note"]
+STATUS_COL, NOTE_COL = 6, 7
+MAPPING_WB = {**MAPPING, "status": "Status", "latest_note": "Latest note"}
+
+
+def _event(
+    *,
+    seconds: int = 60,
+    status: str | None = "in_progress",
+    external: str = "In Progress",
+    priority: str = "High",
+    own: bool = False,
+    comment: TicketComment | None = None,
+) -> TicketEvent:
+    state = None
+    if comment is None:
+        state = TicketState(
+            external_status=external,
+            status=status,
+            priority=priority,
+            assignee_id="acc-1",
+            assignee_name="Olga Ops",
+        )
+    return TicketEvent(
+        kind="comment_created" if comment else "issue_updated",
+        key="OPS-1",
+        occurred_at=TICKET_CREATED_AT + timedelta(seconds=seconds),
+        actor_id="acc-human",
+        actor_name="Olga Ops",
+        from_service_account=own,
+        state=state,
+        comment=comment,
+    )
+
+
+def _comment(comment_id: str = "c1", body: str = "Fixed in 1.4", hours: int = 0) -> TicketComment:
+    return TicketComment(
+        id=comment_id,
+        author_id="acc-human",
+        author_name="Olga Ops",
+        text=body,
+        created_at=datetime(2026, 11, 17, 10, 0, tzinfo=UTC) + timedelta(hours=hours),
+    )
+
+
+async def _status_of(sessionmaker: async_sessionmaker[AsyncSession], record_id: int) -> str | None:
+    async with sessionmaker() as session:
+        return await session.scalar(
+            text(
+                "SELECT s.status_name FROM document_record r "
+                "LEFT JOIN document_record_status s ON s.id = r.status_id WHERE r.id = :id"
+            ),
+            {"id": record_id},
+        )
+
+
+async def _sheet_with_ticket(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> tuple[int, int, FakeSheet, InboundSync]:
+    document_id = await _add_document(sessionmaker, worksheet="Tracked", mapping=MAPPING_WB)
+    sheet = FakeSheet([HEADER_WB, ["Export fails", "Details", "Alice"]])
+    sync = _sync(sessionmaker, sheet)
+    await sync.sync_document(document_id)
+    record_id = (await _records(sessionmaker))[0].id
+    await push_record(sessionmaker, FakeTickets(), record_id, BASE_URL)
+    return document_id, record_id, sheet, sync
+
+
+async def test_creation_reads_back_a_baseline_without_an_event(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    document_id, record_id, sheet, sync = await _sheet_with_ticket(sessionmaker)
+
+    record = (await _records(sessionmaker))[0]
+    assert await _status_of(sessionmaker, record_id) == "open"
+    assert (record.current_priority, record.current_assignee) == ("High", "Olga Ops")
+    assert (await _ticket_sync(sessionmaker, record_id)).ticket_updated_at == TICKET_CREATED_AT
+    assert [e for _, e in await _events(sessionmaker)] == ["created"]
+    # The next sync run shows the initial status in the sheet.
+    await sync.sync_document(document_id)
+    assert sheet.cell(2, STATUS_COL) == "Open"
+
+
+async def test_status_change_is_recorded_and_written_to_the_sheet(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    document_id, record_id, sheet, sync = await _sheet_with_ticket(sessionmaker)
+
+    result = await apply_ticket_event(sessionmaker, _event())
+
+    assert (result.outcome, result.document_id, result.sheet_changed) == (
+        "updated",
+        document_id,
+        True,
+    )
+    assert await _status_of(sessionmaker, record_id) == "in_progress"
+    async with sessionmaker() as session:
+        event = await session.scalar(
+            select(DocumentRecordHistory).where(
+                DocumentRecordHistory.event_type == "status_changed"
+            )
+        )
+    assert event is not None and event.created_by == "Olga Ops"
+    assert event.detail == {"jira_status": "In Progress"}
+    await sync.sync_document(document_id)
+    assert sheet.cell(2, STATUS_COL) == "In progress"
+    assert (await _records(sessionmaker))[0].sheet_written_hash is not None
+
+
+async def test_loop_guards(sessionmaker: async_sessionmaker[AsyncSession]) -> None:
+    _, record_id, _, _ = await _sheet_with_ticket(sessionmaker)
+
+    own = await apply_ticket_event(sessionmaker, _event(own=True, status="done"))
+    before_creation = await apply_ticket_event(sessionmaker, _event(seconds=-5, status="done"))
+    same = await apply_ticket_event(sessionmaker, _event(status="open", external="To Do"))
+    unknown = await apply_ticket_event(sessionmaker, _event().model_copy(update={"key": "OPS-404"}))
+
+    assert (own.outcome, before_creation.outcome, same.outcome, unknown.outcome) == (
+        "own_change",
+        "stale",
+        "unchanged",
+        "unknown_ticket",
+    )
+    assert await _status_of(sessionmaker, record_id) == "open"
+    assert [e for _, e in await _events(sessionmaker)] == ["created"]
+
+
+async def test_out_of_order_events_converge_on_the_newest_state(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    _, record_id, _, _ = await _sheet_with_ticket(sessionmaker)
+    # t+120 says Done/Highest; the older t+60 (In Progress/High) arrives afterwards.
+    newer = _event(seconds=120, status="done", external="Done", priority="Highest")
+    older = _event(seconds=60)
+
+    assert (await apply_ticket_event(sessionmaker, newer)).outcome == "updated"
+    assert (await apply_ticket_event(sessionmaker, older)).outcome == "stale"
+    assert (await apply_ticket_event(sessionmaker, newer)).outcome == "stale"  # redelivery
+
+    assert await _status_of(sessionmaker, record_id) == "done"
+    assert (await _records(sessionmaker))[0].current_priority == "Highest"
+
+
+async def test_unmapped_status_keeps_the_status_but_takes_the_rest(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    _, record_id, _, _ = await _sheet_with_ticket(sessionmaker)
+
+    result = await apply_ticket_event(
+        sessionmaker, _event(status=None, external="In Review", priority="Low")
+    )
+
+    assert (result.outcome, result.sheet_changed) == ("updated", False)
+    assert await _status_of(sessionmaker, record_id) == "open"
+    assert (await _records(sessionmaker))[0].current_priority == "Low"
+
+
+async def test_comments_are_logged_once_and_become_the_latest_note(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    document_id, _, sheet, sync = await _sheet_with_ticket(sessionmaker)
+    multiline = "Deployed." + chr(10) + "Please  check"
+
+    first = await apply_ticket_event(sessionmaker, _event(comment=_comment()))
+    again = await apply_ticket_event(sessionmaker, _event(comment=_comment()))
+    await apply_ticket_event(sessionmaker, _event(comment=_comment("c2", multiline, hours=1)))
+
+    assert (first.outcome, first.sheet_changed, again.outcome) == ("updated", True, "duplicate")
+    async with sessionmaker() as session:
+        comments = list(
+            await session.scalars(
+                select(DocumentRecordHistory.comment)
+                .where(DocumentRecordHistory.event_type == "comment")
+                .order_by(DocumentRecordHistory.create_time)
+            )
+        )
+    assert comments == ["Fixed in 1.4", multiline]
+    await sync.sync_document(document_id)
+    assert sheet.cell(2, NOTE_COL) == "2026-11-17 Olga Ops: Deployed. Please check"
+
+
+async def test_hand_edited_status_cell_is_restored(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    document_id, _, sheet, sync = await _sheet_with_ticket(sessionmaker)
+    await sync.sync_document(document_id)
+    sheet.grid[1][STATUS_COL] = "Done!!"
+
+    report = await sync.sync_document(document_id)
+
+    assert report is not None and report.cells_written == 1
+    assert sheet.cell(2, STATUS_COL) == "Open"

@@ -81,7 +81,7 @@ class JiraConfigChecker:
         account_id, name = me["accountId"], me.get("displayName", "?")
         if account_id != self._config.service_account_id:
             raise _Abort(
-                f"the API token belongs to {name} ({account_id}), but jira.yaml "
+                f"the credentials belong to {name} ({account_id}), but jira.yaml "
                 f"service_account_id is {self._config.service_account_id}; webhook loop "
                 "protection would not recognise the system's own changes"
             )
@@ -159,7 +159,17 @@ class JiraConfigChecker:
             raise _CheckFailed(f"no workflow statuses returned for {self._config.issue_type}")
         available = {s["name"] for s in entry.get("statuses") or []}
         _require_all_present("statuses", self._config.statuses, available)
-        return f"{len(self._config.statuses)} mapped, all in the {self._config.issue_type} workflow"
+        mapped = {name.casefold() for name in self._config.statuses.values()}
+        unmapped = sorted(n for n in available if n.casefold() not in mapped)
+        note = (
+            f"; not mapped (tickets moved there keep their last status): {', '.join(unmapped)}"
+            if unmapped
+            else ""
+        )
+        return (
+            f"{len(self._config.statuses)} mapped, all in the {self._config.issue_type} "
+            f"workflow{note}"
+        )
 
     async def _check_assignees(self) -> str:
         not_assignable = []

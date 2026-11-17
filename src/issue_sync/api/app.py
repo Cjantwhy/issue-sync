@@ -41,7 +41,14 @@ def _lifespan(settings: Settings):
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
-    app = FastAPI(title="issue-sync", lifespan=_lifespan(settings))
+    docs = settings.enable_api_docs
+    app = FastAPI(
+        title="issue-sync",
+        lifespan=_lifespan(settings),
+        docs_url="/docs" if docs else None,
+        redoc_url=None,
+        openapi_url="/openapi.json" if docs else None,
+    )
     app.state.settings = settings
     app.include_router(health.router)
     app.include_router(webhooks.router)

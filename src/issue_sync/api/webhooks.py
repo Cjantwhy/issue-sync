@@ -3,18 +3,30 @@
 `POST /webhooks/sheets` is called by the Apps Script trigger in `apps_script/Code.gs`.
 The payload only says *which* worksheet changed; its contents are never trusted. The
 handler enqueues a sync job, and the job re-reads the worksheet through the API.
+
+`POST /webhooks/jira` is called by a Jira admin webhook. The HMAC signature is checked
+over the raw body, events from the service account are dropped, and the rest are queued
+for the worker, so Jira gets its answer quickly and never times out and re-sends.
 """
 
 import hmac
+import json
 import logging
 from collections.abc import Awaitable, Callable
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from issue_sync.db.models import Document
+from issue_sync.tickets.jira.webhook import (
+    SIGNATURE_HEADER,
+    SUPPORTED_EVENTS,
+    actor_id,
+    slim_payload,
+    valid_signature,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +37,9 @@ SECRET_HEADER = "X-Issue-Sync-Secret"
 # (spreadsheet_id, worksheet_name) -> (document id, sync_enabled), or None if unknown
 DocumentFinder = Callable[[str, str], Awaitable[tuple[int, bool] | None]]
 Enqueue = Callable[[int], Awaitable[None]]
+EnqueueEvent = Callable[[dict[str, Any]], Awaitable[None]]
+
+MAX_JIRA_BODY_BYTES = 2_000_000
 
 
 class SheetsEvent(BaseModel):
@@ -90,4 +105,42 @@ async def sheets_webhook(
     if not enabled:
         return WebhookResponse(status="ignored")
     await enqueue_sync(document_id)
+    return WebhookResponse(status="queued")
+
+
+def get_service_account_id(request: Request) -> str:
+    return request.app.state.adapter_configs.jira.service_account_id
+
+
+def get_ticket_event_enqueuer(request: Request) -> EnqueueEvent:
+    redis = request.app.state.redis
+
+    async def enqueue(payload: dict[str, Any]) -> None:
+        await redis.enqueue_job("ticket_event", payload)
+
+    return enqueue
+
+
+@router.post("/jira", status_code=status.HTTP_202_ACCEPTED)
+async def jira_webhook(
+    request: Request,
+    service_account_id: Annotated[str, Depends(get_service_account_id)],
+    enqueue_event: Annotated[EnqueueEvent, Depends(get_ticket_event_enqueuer)],
+) -> WebhookResponse:
+    body = await request.body()
+    if len(body) > MAX_JIRA_BODY_BYTES:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "payload too large")
+    secret = request.app.state.settings.jira_webhook_secret.get_secret_value()
+    if not valid_signature(body, request.headers.get(SIGNATURE_HEADER), secret):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or missing signature")
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "body is not JSON") from None
+    if not isinstance(payload, dict) or payload.get("webhookEvent") not in SUPPORTED_EVENTS:
+        return WebhookResponse(status="ignored")
+    if actor_id(payload) == service_account_id:
+        # The system's own change coming back: the first loop guard.
+        return WebhookResponse(status="ignored")
+    await enqueue_event(slim_payload(payload))
     return WebhookResponse(status="queued")

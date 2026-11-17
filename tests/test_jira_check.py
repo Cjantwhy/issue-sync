@@ -215,7 +215,15 @@ def test_cli_reports_missing_settings(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, tmp_path: Any
 ) -> None:
     monkeypatch.chdir(tmp_path)  # no .env here
-    for var in ("JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN"):
+    for var in ("JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_CLIENT_ID", "JIRA_CLIENT_SECRET"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("JIRA_BASE_URL", "https://example.atlassian.net")
+
+    monkeypatch.setenv("JIRA_AUTH", "basic")
     assert cli.main(["jira-check"]) == 2
-    assert "jira_api_token" in capsys.readouterr().err
+    assert "JIRA_AUTH=basic requires JIRA_EMAIL, JIRA_API_TOKEN" in capsys.readouterr().err
+
+    monkeypatch.setenv("JIRA_AUTH", "oauth")
+    monkeypatch.setenv("JIRA_CLOUD_ID", "cloud-1")
+    assert cli.main(["jira-check"]) == 2
+    assert "requires JIRA_CLIENT_ID, JIRA_CLIENT_SECRET" in capsys.readouterr().err

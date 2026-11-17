@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator
 
+import httpx
 import pytest
 import respx
 
@@ -41,7 +42,7 @@ async def jira_mock() -> AsyncIterator[respx.MockRouter]:
 
 @pytest.fixture
 async def jira_client(jira_mock: respx.MockRouter) -> AsyncIterator[JiraClient]:
-    async with JiraClient(SITE, EMAIL, TOKEN) as client:
+    async with JiraClient(SITE, httpx.BasicAuth(EMAIL, TOKEN)) as client:
         yield client
 
 

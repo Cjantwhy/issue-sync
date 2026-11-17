@@ -31,17 +31,20 @@ _LOGIN_FAILED = {"AUTHENTICATED_FAILED", "AUTHENTICATION_DENIED"}
 class JiraClient:
     def __init__(
         self,
-        base_url: str,
-        email: str,
-        api_token: str,
+        site_url: str,
+        auth: httpx.Auth,
         *,
+        api_base_url: str | None = None,
         timeout: httpx.Timeout = DEFAULT_TIMEOUT,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        self.base_url = base_url.rstrip("/")
+        """`site_url` is for links people open; `api_base_url` (default: the site) for
+        API calls, e.g. the api.atlassian.com gateway for service accounts."""
+        self.base_url = site_url.rstrip("/")
+        self._auth = auth
         self._http = httpx.AsyncClient(
-            base_url=self.base_url + API_PREFIX,
-            auth=httpx.BasicAuth(email, api_token),
+            base_url=(api_base_url or site_url).rstrip("/") + API_PREFIX,
+            auth=auth,
             headers={"Accept": "application/json"},
             timeout=timeout,
             transport=transport,
@@ -49,6 +52,8 @@ class JiraClient:
 
     async def aclose(self) -> None:
         await self._http.aclose()
+        if (close := getattr(self._auth, "aclose", None)) is not None:
+            await close()
 
     async def __aenter__(self) -> "JiraClient":
         return self

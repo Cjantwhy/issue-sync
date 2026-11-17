@@ -9,7 +9,7 @@ in tests, not to anticipate other backends.
 
 import uuid
 from datetime import datetime
-from typing import Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
@@ -66,6 +66,40 @@ class TicketSnapshot(_Model):
     assignee_id: str | None
     assignee_name: str | None
     updated_at: datetime
+
+
+class TicketState(_Model):
+    """Ticket-owned fields as of one event."""
+
+    external_status: str
+    status: str | None  # internal status, None if the external status is not mapped
+    priority: str | None
+    assignee_id: str | None
+    assignee_name: str | None
+
+
+class TicketComment(_Model):
+    id: str
+    author_id: str | None
+    author_name: str | None
+    text: str
+    created_at: datetime
+
+
+class TicketEvent(_Model):
+    """A change reported by the ticket system's webhook, in internal values."""
+
+    kind: Literal["issue_updated", "comment_created"]
+    key: str
+    occurred_at: datetime
+    actor_id: str | None
+    actor_name: str | None
+    # Made by this system's own account: ignored, or the sync would loop.
+    from_service_account: bool
+    # issue_updated: the full state at `occurred_at` (not just what changed), so events
+    # applied out of order still converge on the newest state.
+    state: TicketState | None = None
+    comment: TicketComment | None = None
 
 
 # ---------- Errors ----------
@@ -135,6 +169,10 @@ class TicketBackend(Protocol):
     async def add_comment(self, key: str, text: str) -> None: ...
 
     async def get_ticket(self, key: str) -> TicketSnapshot: ...
+
+    async def parse_webhook(self, payload: dict[str, Any]) -> TicketEvent | None:
+        """Translate a webhook payload. None for events this system does not track."""
+        ...
 
     def ticket_url(self, key: str) -> str:
         """Link to the ticket for people (e.g. in notifications)."""

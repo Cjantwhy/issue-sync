@@ -8,6 +8,8 @@ Jobs:
 - `push_ticket`: AI triage and assignment rules (new records), then database -> ticket
   system for one record, retried with backoff. Enqueues `notify_ticket` for new tickets.
 - `notify_ticket`: Slack message for a new ticket, sent once (ticket_sync.notified_at).
+- `ticket_event`: a Jira webhook event -> database; enqueues `sync_document` to write
+  the new status or latest note back to the sheet.
 """
 
 import logging
@@ -31,12 +33,15 @@ from issue_sync.sync.inbound import InboundSync
 from issue_sync.sync.notify import Notifier, notify_record
 from issue_sync.sync.push import Triage, push_record
 from issue_sync.sync.retry import poll_schedule, retry_delay
+from issue_sync.sync.ticket_events import apply_ticket_event
+from issue_sync.tickets.base import TicketBackendError
 from issue_sync.tickets.jira.backend import JiraBackend, create_jira_client
 
 logger = logging.getLogger(__name__)
 
 SYNC_MAX_TRIES = 5
 NOTIFY_MAX_TRIES = 5
+TICKET_EVENT_MAX_TRIES = 5
 
 
 async def enqueue_notify(ctx: dict[str, Any], record_id: int) -> None:
@@ -185,12 +190,36 @@ async def notify_ticket(ctx: dict[str, Any], record_id: int) -> str:
         return "failed"
 
 
+async def ticket_event(ctx: dict[str, Any], payload: dict[str, Any]) -> str:
+    try:
+        event = await ctx["ticket_backend"].parse_webhook(payload)
+    except TicketBackendError as exc:  # loading the project's statuses failed
+        delay = retry_delay(
+            retryable=exc.retryable,
+            attempt=ctx["job_try"],
+            max_attempts=TICKET_EVENT_MAX_TRIES,
+            retry_after=exc.retry_after,
+        )
+        if delay is not None:
+            raise Retry(defer=delay) from exc
+        logger.error("could not parse a Jira event: %s", exc)
+        return "failed"
+    if event is None:
+        return "ignored"
+    result = await apply_ticket_event(ctx["sessionmaker"], event)
+    if result.sheet_changed and result.document_id is not None:
+        await ctx["redis"].enqueue_job("sync_document", result.document_id)
+    logger.info("Jira %s on %s: %s", event.kind, event.key, result.outcome)
+    return result.outcome
+
+
 class WorkerSettings:
     functions: ClassVar[list[Any]] = [
         ping,
         func(sync_document, max_tries=SYNC_MAX_TRIES),
         func(push_ticket, max_tries=get_settings().push_max_attempts),
         func(notify_ticket, max_tries=NOTIFY_MAX_TRIES),
+        func(ticket_event, max_tries=TICKET_EVENT_MAX_TRIES),
     ]
     cron_jobs: ClassVar[list[Any]] = [
         cron(

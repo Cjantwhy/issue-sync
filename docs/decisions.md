@@ -242,3 +242,53 @@ One entry per trade-off: context, what was chosen, and why not the alternative.
 ### A rule's effect is explained in a Jira comment, only when it changed something
 - **Chosen:** When a rule changes the team or urgency, a comment such as `Rule 'Month-end close is at least high': urgency low -> high` is added right after creation. It is a comment rather than part of the description because it records a decision made once at creation, while the description is rebuilt on every push. The comment is best effort: if it fails, the push still succeeds. A rule that matches but agrees with the AI writes nothing; the live test showed such "no change" comments are just noise.
 - **Caveat:** The notification job re-evaluates the rules to name the team. If the request or the rules change in the seconds between creation and notification, the message can differ from what the ticket got.
+
+## Milestone 6 — Jira webhooks: ticket changes back to the database and sheet
+
+### A dedicated Atlassian service account, authenticated with OAuth 2.0
+- **Context:** Loop protection ignores changes made by the system's own account. While that account was a person's, that person's manual edits in Jira were ignored too.
+- **Chosen:** An Atlassian service account (free, not counted as a user) with an OAuth 2.0 client-credentials credential. The client exchanges id and secret at auth.atlassian.com for a 60-minute token, caches it, refreshes it two minutes early, and retries once after a 401. Service-account calls must go through the api.atlassian.com gateway for the site's cloud id. The site URL stays separate and is used only for links people open. `JIRA_AUTH=basic` (email + API token) remains for regular accounts.
+- **Not chosen:** A second human account, which takes a user seat and uses a long-lived token. A scoped API token for the service account was also possible; OAuth avoids yearly token expiry, and its access tokens are short-lived.
+
+### Names in `jira.yaml` are the service account's; webhook statuses are matched by id
+- **Context:** Found live: the service account sees English names ("Task", "In Progress") while the site and its admin use Chinese ones. Webhook payloads are not guaranteed to use the service account's language.
+- **Chosen:** `jira.yaml` uses the names the service account sees, and `jira-check` verifies them. Webhook statuses are resolved by **id**: the backend loads the project's statuses once as the service account, maps id → name → internal status, and reloads (at most once a minute) when an unknown id appears.
+- **Not chosen:** Matching webhook status names directly. It would break silently as soon as the payload language differed.
+
+### The webhook endpoint verifies, filters and queues; the worker applies
+- **Chosen:** `POST /webhooks/jira` checks the HMAC-SHA256 `X-Hub-Signature` over the raw body (constant-time), caps the body at 2 MB, drops unsupported events and events by the service account, and queues a slimmed payload (key, status, priority, assignee, comment). Jira gets a fast 202 and has no reason to retry. Parsing and database work happen in the `ticket_event` job, which can retry.
+- **Not chosen:** Applying events inside the request. A slow database or a status lookup in Jira would make Jira time out and re-send.
+
+### Events carry full state; ordering uses `ticket_updated_at`
+- **Chosen:** For "issue updated" events the system applies the issue's full status, priority and assignee from the payload, not the changelog. Events no newer than `ticket_sync.ticket_updated_at` are dropped. Because every event carries the complete state, dropping an older event that arrives late loses nothing: the newer one already contained its change. Values equal to the database write nothing. Comment events do not move the watermark (a comment could otherwise hide an older status event). They are de-duplicated by Jira comment id instead, so redelivered webhooks do not duplicate history.
+- **Not chosen:** Applying changelog items one by one. That needs strict ordering, which webhooks do not guarantee.
+
+### What is recorded
+- **Chosen:**
+  - A status change writes a `status_changed` event (from/to, the actor's display name, the Jira status name).
+  - Priority and assignee are snapshot fields on the record (`current_priority`, `current_assignee`, display names for people); the schema has no event type for them.
+  - Comments become `comment` events with plain text (ADF or wiki markup reduced to text) and the author.
+  - Comment edits and deletions are not synced: the history is append-only.
+  - A Jira status without a mapping (e.g. "In Review") leaves the internal status unchanged, logs a warning, and still updates priority and assignee. `jira-check` now lists such statuses.
+
+### A baseline is read right after creation
+- **Chosen:** After creating (or linking) a ticket, the push reads it back once to set the record's status, priority, assignee and the `ticket_updated_at` watermark. The first status is recorded without a `status_changed` event, because nobody changed anything. Best effort: if the read fails, the push still succeeds and the next event fills the fields in.
+
+### The sheet is written in one place
+- **Chosen:** Applying an event updates the database only, then enqueues `sync_document` for that worksheet when something visible in the sheet changed. The sync run already reads the sheet under the document lock, so it writes Status and Latest note at the rows' current positions, together with the detail link, and records `sheet_written_hash`. The same step also restores system cells edited by hand.
+- **Not chosen:** Writing cells straight from the event job. It would need to find the row itself, outside the document lock, and could race with a sync run moving rows.
+- **Display:**
+  - Status shows the internal value in readable form ("In progress"), independent of Jira's language.
+  - Latest note is the newest comment on one line: `2026-11-17 Olga Ops: Fixed in 1.4`.
+
+### Status lookups are serialized
+- **Context:** Found live: a single drag to "Done" produced two webhooks a fraction of a second apart. While one job was loading the status list, the other skipped the load (cool-down) and fell back to the payload's status name. That worked only because the name happened to be English.
+- **Chosen:** Loading the project's statuses is guarded by a lock. Concurrent events wait for the one load in flight, then resolve by id. The cool-down starts only after a load succeeds. A regression test sends two concurrent events with Chinese status names.
+- **Also seen live:** The older of the two events was processed second and dropped as stale, as designed.
+
+### Public exposure through a Cloudflare Tunnel
+- **Chosen:** A named tunnel on a dedicated hostname that routes only `/webhooks/(sheets|jira)` to the api. Everything else (`/health`, `/docs`, later the dashboard) answers 404 from outside. A WAF rule blocks non-POST requests to the webhook paths. Authentication stays in the application (HMAC for Jira, shared secret for Sheets), so the tunnel never relies on a URL staying secret.
+- **Found live:** Cloudflare's Bot Fight Mode blocks Jira's webhook deliveries, which come from Atlassian's servers as automated traffic. On the free plan it cannot be skipped per path, so it is turned off for the zone. Deliveries rejected that way are not retried by Jira. Missed changes are recovered by the reconciliation in milestone 7.
+
+### API docs off by default
+- **Chosen:** `/docs` and `/openapi.json` are served only with `ENABLE_API_DOCS=true`. Once webhooks are reachable from the internet, an endpoint map is information an attacker does not need.
