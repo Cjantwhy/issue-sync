@@ -30,6 +30,8 @@ def app() -> FastAPI:
         jira_base_url="https://example.atlassian.net",
         jira_email="bot@example.com",
         jira_api_token="token",
+        public_base_url="http://localhost:8000",
+        sheets_webhook_secret="x" * 32,
     )
     return create_app(settings)
 

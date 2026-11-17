@@ -8,3 +8,4 @@ config/*.yaml
 !config/*.example.yaml
 tests
 docs
+secrets

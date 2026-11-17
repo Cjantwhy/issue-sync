@@ -37,10 +37,35 @@ class JiraSettings(_EnvSettings):
     jira_config_path: Path = Path("config/jira.yaml")
 
 
-class Settings(DatabaseSettings, JiraSettings):
+class GoogleSettings(_EnvSettings):
+    google_service_account_file: Path = Field(
+        default=Path("secrets/google-service-account.json"),
+        description="JSON key of the Google service account the sheets are shared with",
+    )
+
+
+def _valid_poll_interval(seconds: int) -> int:
+    # arq cron schedules by second/minute sets, so the interval must divide a minute or an hour.
+    if (seconds < 60 and 60 % seconds == 0) or (seconds % 60 == 0 and 60 % (seconds // 60) == 0):
+        return seconds
+    raise ValueError("must divide 60 seconds (e.g. 15, 30) or 60 minutes (e.g. 60, 300, 600)")
+
+
+class Settings(DatabaseSettings, JiraSettings, GoogleSettings):
     redis_url: str = Field(description="Redis URL used by arq, e.g. redis://redis:6379/0")
     slack_config_path: Path = Path("config/slack.yaml")
     log_level: str = "INFO"
+
+    public_base_url: BaseUrl = Field(
+        description="Public URL of this service; detail-page links written to the sheet use it",
+    )
+    sheets_webhook_secret: SecretStr = Field(
+        min_length=16, description="Shared secret the Apps Script trigger sends"
+    )
+    sheets_poll_interval_seconds: Annotated[
+        int, Field(ge=10), AfterValidator(_valid_poll_interval)
+    ] = 60
+    push_max_attempts: int = Field(default=8, ge=1, description="Ticket push attempts per job")
 
 
 @lru_cache

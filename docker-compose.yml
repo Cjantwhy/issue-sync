@@ -1,6 +1,6 @@
 # Local / single-host stack: `docker compose up --build`
-# Requires .env (copy from .env.example) and config/jira.yaml + config/slack.yaml
-# (copy from the *.example.yaml files).
+# Requires .env (copy from .env.example), config/jira.yaml + config/slack.yaml
+# (copy from the *.example.yaml files) and the Google service account key in ./secrets/.
 
 x-app: &app
   build: .
@@ -12,9 +12,12 @@ x-app: &app
     REDIS_URL: redis://redis:6379/0
     JIRA_CONFIG_PATH: /app/config/jira.yaml
     SLACK_CONFIG_PATH: /app/config/slack.yaml
+    GOOGLE_SERVICE_ACCOUNT_FILE: /app/secrets/google-service-account.json
   volumes:
     - ./config/jira.yaml:/app/config/jira.yaml:ro
     - ./config/slack.yaml:/app/config/slack.yaml:ro
+    # A directory, not the file: a missing file mount would be created as a directory.
+    - ./secrets:/app/secrets:ro
 
 services:
   postgres:

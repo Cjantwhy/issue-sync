@@ -10,7 +10,7 @@ from arq import create_pool
 from arq.connections import RedisSettings
 from fastapi import FastAPI
 
-from issue_sync.api import health
+from issue_sync.api import health, webhooks
 from issue_sync.db.session import create_engine, create_sessionmaker
 from issue_sync.log_setup import configure_logging
 from issue_sync.settings import Settings, get_settings
@@ -27,7 +27,7 @@ def _lifespan(settings: Settings):
             app.state.adapter_configs = await run_startup_checks(settings, engine)
             app.state.engine = engine
             app.state.sessionmaker = create_sessionmaker(engine)
-            # ArqRedis is a redis.asyncio.Redis: used for health pings and, later, enqueuing jobs.
+            # ArqRedis is a redis.asyncio.Redis: used for health pings and enqueuing jobs.
             app.state.redis = await create_pool(RedisSettings.from_dsn(settings.redis_url))
             try:
                 yield
@@ -42,5 +42,7 @@ def _lifespan(settings: Settings):
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     app = FastAPI(title="issue-sync", lifespan=_lifespan(settings))
+    app.state.settings = settings
     app.include_router(health.router)
+    app.include_router(webhooks.router)
     return app

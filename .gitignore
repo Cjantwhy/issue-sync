@@ -222,3 +222,6 @@ __marimo__/
 # Real adapter configs (commit only *.example.yaml)
 config/*.yaml
 !config/*.example.yaml
+
+# Google service account key and other secret files
+secrets/

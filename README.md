@@ -12,6 +12,7 @@ Requires Docker with Compose v2.
 cp .env.example .env
 cp config/jira.example.yaml config/jira.yaml
 cp config/slack.example.yaml config/slack.yaml
+# plus the Google service account key in secrets/ (see "Google Sheets setup")
 docker compose up -d --build --wait
 curl localhost:8000/health
 # {"status":"ok","checks":{"database":"ok","redis":"ok"}}
@@ -47,5 +48,36 @@ uv run issue-sync jira-check
 It checks the credentials and service account, project and issue type, create-screen
 fields, priorities, workflow statuses and assignees. It exits with a non-zero code if
 any check fails.
+
+## Google Sheets setup
+
+1. In Google Cloud, enable the Google Sheets API, create a service account and save its
+   JSON key as `secrets/google-service-account.json` (git-ignored).
+2. Share the spreadsheet with the service account's `client_email` as an **Editor**.
+3. Give the worksheet a header row. Default header names are `Title`, `Description`,
+   `Reporter`, `Contact`, `System ID`, `Detail link`, plus `Status` and `Latest note`
+   (written back from Jira in a later milestone).
+4. Register the worksheet. The command checks access and headers before saving:
+
+   ```bash
+   uv run issue-sync add-document --name "Support requests" \
+     --spreadsheet "https://docs.google.com/spreadsheets/d/<id>/edit" --worksheet "Sheet1"
+   # other header names: --map title="Issue"   drop an optional field: --map contact=
+   ```
+
+The worker polls every registered worksheet (`SHEETS_POLL_INTERVAL_SECONDS`, default 60).
+For near-instant sync, install the Apps Script trigger in
+[`apps_script/Code.gs`](apps_script/Code.gs). It calls `POST /webhooks/sheets`, so the api
+must be reachable from Google (for local testing, use a tunnel such as `cloudflared`).
+
+## How a row becomes a ticket
+
+1. A trigger or the poll enqueues `sync_document`, which re-reads the worksheet.
+2. Rows without a `System ID` get a UUID and a detail link written back to the sheet.
+3. Rows whose content changed (SHA-256 of the row, system columns excluded) are saved
+   with a `created` or `source_modified` event and marked for a push.
+4. `push_ticket` creates the Jira issue, or updates its title and description, retrying
+   with backoff on transient failures. Pushes are serialized per row and look for an
+   existing ticket before creating one, so a row never produces two tickets.
 
 See [docs/decisions.md](docs/decisions.md) for design decisions.

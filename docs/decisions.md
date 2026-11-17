@@ -128,3 +128,51 @@ One entry per trade-off: context, what was chosen, and why not the alternative.
 - **Context:** Found in the live test on a zh-CN site: createmeta returns localized issue type names ("任务") while `/project/{key}/statuses` returns English ones ("Task"). Status names are also shown in the site's language ("待办", "正在进行", "已完成").
 - **Chosen:** `jira-check` matches the issue type across endpoints by id. `jira.yaml` uses the names as the service account sees them, and `jira-check` verifies them with the same account. The service account's language should not be changed after setup.
 - **Not chosen:** Switching `jira.yaml` to numeric ids. Names keep the config readable and are verified by `jira-check`; ids would only be needed if the account's language had to change.
+
+## Milestone 3 — Sheets intake and the main pipeline
+
+### Triggers only name the worksheet
+- **Chosen:** The Apps Script trigger and the poll both just enqueue `sync_document(document_id)`. The job always re-reads the whole worksheet through the API. The webhook payload is never trusted for content, and a missed or duplicated trigger is harmless.
+- **Not chosen:** Sending the edited cells in the webhook. Apps Script triggers are best effort (they miss some edits and can fire twice), and the payload would become a second source of truth.
+
+### One sync run per worksheet at a time
+- **Context:** An Apps Script push and the poll can fire together. Two runs that both see a row without an id would each write a different UUID and create two records.
+- **Chosen:** A run holds `SELECT ... FOR NO KEY UPDATE` on its `document` row until it finishes; a second run waits, then reads the sheet with the ids already written. `NO KEY UPDATE` rather than `UPDATE`, because inserting a record takes a `KEY SHARE` lock on the same row for the foreign key, which `FOR UPDATE` would block. Each row is then written in its own transaction under `SELECT ... FOR UPDATE` on the record.
+- **Not chosen:** De-duplicating jobs with a fixed arq job id. arq drops an enqueue while a job with that id is running, so an edit made during a run would wait for the next poll.
+
+### Identity is written to the sheet before the record exists
+- **Chosen:** New rows first get their UUID and detail link written to the sheet, then the record is inserted. If anything fails afterwards, the next run sees a row with an unknown UUID and creates the record with that UUID; it never invents a second one. Right before writing, the sheet is re-read, and a row is only claimed if it is still at the same position with the same content and an empty id cell.
+- **Not chosen:** Insert first, write back later. A failed write-back would leave a record the sheet cannot point to, and the next run would create a duplicate.
+- **Caveat:** The Sheets API has no compare-and-set, so a row inserted in the few milliseconds between the re-read and the write could still receive the id. Reconciliation (milestone 7) detects the resulting orphan.
+
+### Rows with bad or repeated ids are skipped, not repaired
+- **Chosen:** A system_id cell that is not a UUID, appears twice in the worksheet, or belongs to another document is logged and the row is skipped. It is never overwritten with a fresh id, because that could turn one request into two tickets. Repairing it is an operator task; milestone 7 adds alerts.
+
+### Change detection ignores system-owned columns
+- **Chosen:** `raw` keeps the whole row. `raw_hash` covers every column except system_id, detail link, status and latest note; otherwise writing a link back would look like an edit. A change in an unmapped column updates `raw` silently. Only changes to mapped fields write a `source_modified` event (with before/after values) and mark the ticket for a push.
+
+### Push queue state lives in `ticket_sync.push_status`
+- **Chosen:** A new or edited record is `pending`. Every sync run returns all pending records of the worksheet and enqueues a push for each, including ones from earlier runs. A push job lost between the commit and the enqueue (e.g. Redis briefly down) is therefore recovered by the next poll. Pushing is idempotent (`pushed_hash` comparison), so an extra job costs nothing.
+
+### A push locks `ticket_sync` across the HTTP call and always searches before creating
+- **Chosen:** `push_record` holds `SELECT ... FOR UPDATE` on the record's `ticket_sync` row for the whole push, including the Jira calls, so pushes of one record never overlap. Before creating, it always looks for a ticket with the record's `issue-sync-<system_id>` label, so a timed-out create, or a worker that crashed after Jira answered, is linked instead of duplicated. That costs one search per new ticket.
+- **Not chosen:** Searching only when `retry_count > 0`. A crash between Jira's response and the commit leaves no trace in the database, so the counter cannot be trusted for this.
+
+### Retry policy
+- **Chosen:** Backoff of 10 s, doubled each attempt, capped at 15 minutes; a longer `Retry-After` wins. The first delay is not shorter because Jira's search index lags a few seconds behind a create. Pushes give up after `PUSH_MAX_ATTEMPTS` (default 8, about 20 minutes) and stay `failed` with `last_error`. A failed sync run is retried a few times and then left to the next poll, since nothing is lost.
+
+### Detail links are corrected on every run
+- **Chosen:** A detail link that is missing or edited by hand is rewritten, and `sheet_written_hash` / `sheet_written_at` are recorded. Unlike ids, links are written without re-reading first: if rows shift meanwhile, the next run fixes the wrong link, and no identity is touched.
+
+### Sheet values: read formatted, write raw
+- **Chosen:** Rows are read as `FORMATTED_VALUE`, so the system stores what people see. System cells are written with `valueInputOption=RAW`, so nothing the system writes is interpreted as a formula. `title`, `reporter` and `contact` are cut to their 255-character columns; `raw` keeps the full text.
+
+### Google auth without a second HTTP stack
+- **Chosen:** google-auth only signs the service-account JWT. The token exchange and the Sheets calls go through httpx, so they are async and mocked with respx like Jira. The token is cached and refreshed 5 minutes before expiry; one automatic retry after a 401 covers a token revoked early.
+- **Not chosen:** google-api-python-client, which is synchronous and brings its own transport into an async worker.
+
+### Worksheets are registered with `issue-sync add-document`
+- **Chosen:** The command reads the worksheet's header row first and refuses a mapping that does not match, before writing the `document` row. Optional fields are only mapped when their default header exists, so a typical sheet needs no flags. Spreadsheet ids and mappings live in the database, not in env vars, so one deployment can sync several sheets.
+
+### Service account key mounted as a directory
+- **Chosen:** Compose mounts `./secrets` read-only rather than the single key file. Docker silently creates a missing single-file mount as an empty directory, which then fails with a confusing error.

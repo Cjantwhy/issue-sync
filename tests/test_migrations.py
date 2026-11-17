@@ -1,67 +1,32 @@
-"""Integration tests against a real PostgreSQL server.
-
-Set TEST_DATABASE_URL to a server where the tests may create and drop databases, e.g.
-postgresql+asyncpg://issue_sync:change-me@localhost:5432/postgres. Each test module run
-creates a uniquely named throwaway database and drops it afterwards, so no existing data
-is touched. Skipped when TEST_DATABASE_URL is unset.
-"""
+"""Migration tests against a real PostgreSQL server (see tests/db_fixtures.py)."""
 
 import asyncio
 import os
 import subprocess
 import sys
-import uuid
 from collections.abc import Iterator
-from pathlib import Path
 
 import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
-from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
-from sqlalchemy import make_url, pool, text
+from sqlalchemy import pool, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from issue_sync.adapter_config import load_adapter_configs
 from issue_sync.db.models import Base
 from issue_sync.startup_checks import check_mappings, load_internal_constants
+from tests.db_fixtures import REPO_ROOT, alembic_config, integration, throwaway_database
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = REPO_ROOT / "config"
-TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not TEST_DATABASE_URL, reason="TEST_DATABASE_URL not set"),
-]
-
-
-async def _admin_execute(sql: str) -> None:
-    engine = create_async_engine(
-        TEST_DATABASE_URL, isolation_level="AUTOCOMMIT", poolclass=pool.NullPool
-    )
-    try:
-        async with engine.connect() as conn:
-            await conn.execute(text(sql))
-    finally:
-        await engine.dispose()
+pytestmark = integration
 
 
 @pytest.fixture(scope="module")
 def database_url() -> Iterator[str]:
-    name = f"issue_sync_test_{uuid.uuid4().hex[:12]}"
-    asyncio.run(_admin_execute(f'CREATE DATABASE "{name}"'))
-    try:
-        yield make_url(TEST_DATABASE_URL).set(database=name).render_as_string(hide_password=False)
-    finally:
-        asyncio.run(_admin_execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
-
-
-def _alembic_config(database_url: str) -> Config:
-    config = Config(str(REPO_ROOT / "alembic.ini"))
-    config.attributes["database_url"] = database_url
-    config.attributes["configure_logger"] = False
-    return config
+    with throwaway_database() as url:
+        yield url
 
 
 async def _run_sync_on(database_url: str, fn):  # type: ignore[no-untyped-def]
@@ -126,12 +91,12 @@ def test_concurrent_upgrades_serialize(database_url: str) -> None:
 
 
 def test_orm_models_match_migrated_schema(database_url: str) -> None:
-    command.upgrade(_alembic_config(database_url), "head")
+    command.upgrade(alembic_config(database_url), "head")
     assert _schema_diff(database_url) == []
 
 
 def test_example_configs_cover_seeded_constants(database_url: str) -> None:
-    command.upgrade(_alembic_config(database_url), "head")
+    command.upgrade(alembic_config(database_url), "head")
 
     async def load():  # type: ignore[no-untyped-def]
         engine = create_async_engine(database_url, poolclass=pool.NullPool)
@@ -150,7 +115,7 @@ def test_example_configs_cover_seeded_constants(database_url: str) -> None:
 
 
 def test_downgrade_then_upgrade_round_trip(database_url: str) -> None:
-    config = _alembic_config(database_url)
+    config = alembic_config(database_url)
     command.upgrade(config, "head")
     command.downgrade(config, "base")
     assert _table_names(database_url) == {"alembic_version"}
