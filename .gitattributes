@@ -1,0 +1,2 @@
+# Normalize line endings: files are copied into Linux containers.
+* text=auto eol=lf

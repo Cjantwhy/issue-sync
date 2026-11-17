@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Real adapter configs (commit only *.example.yaml)
+config/*.yaml
+!config/*.example.yaml

@@ -1,0 +1,14 @@
+# Slack adapter config. Copy to config/slack.yaml (git-ignored) and fill in real values.
+# Every role in the assignee_role table must have an entry under `users`.
+#
+# The bot token is NOT stored here; it comes from an env var.
+
+# Channel used for notifications that have no specific recipient.
+default_channel: "C0000000000"
+
+# internal role (assignee_role.role_name) -> Slack user ID
+users:
+  backend: "U0000000001"
+  frontend: "U0000000002"
+  ops: "U0000000003"
+  support: "U0000000004"

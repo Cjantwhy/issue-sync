@@ -1,0 +1,93 @@
+"""Fail-fast checks run by both the api and the worker before they accept work.
+
+Every internal value in the database constant tables must have a mapping in the adapter
+configs. A missing mapping would otherwise only surface at runtime, e.g. when the first
+ticket with that urgency is created.
+"""
+
+import logging
+from dataclasses import dataclass
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+from issue_sync.adapter_config import AdapterConfigs, load_adapter_configs
+from issue_sync.db.models import AiJudgementUrgency, AssigneeRole, DocumentRecordStatus
+from issue_sync.settings import Settings
+
+logger = logging.getLogger(__name__)
+
+
+class StartupCheckError(Exception):
+    """Configuration and database disagree; the process must not start."""
+
+
+@dataclass(frozen=True)
+class InternalConstants:
+    statuses: frozenset[str]
+    urgencies: frozenset[str]
+    roles: frozenset[str]
+
+
+@dataclass(frozen=True)
+class MappingReport:
+    missing: list[str]  # fatal: internal value without a mapping, or empty constant table
+    unknown: list[str]  # warning: mapping for a value the database does not have
+
+    @property
+    def ok(self) -> bool:
+        return not self.missing
+
+
+async def load_internal_constants(engine: AsyncEngine) -> InternalConstants:
+    async with engine.connect() as conn:
+        statuses = (await conn.scalars(select(DocumentRecordStatus.status_name))).all()
+        urgencies = (await conn.scalars(select(AiJudgementUrgency.urgency_level_name))).all()
+        roles = (await conn.scalars(select(AssigneeRole.role_name))).all()
+    return InternalConstants(frozenset(statuses), frozenset(urgencies), frozenset(roles))
+
+
+def check_mappings(constants: InternalConstants, configs: AdapterConfigs) -> MappingReport:
+    jira, slack = configs.jira, configs.slack
+    # (constant table, internal values, config file label, mapped keys)
+    pairs = [
+        ("document_record_status", constants.statuses, "jira.yaml: statuses", jira.statuses),
+        ("ai_judgement_urgency", constants.urgencies, "jira.yaml: priorities", jira.priorities),
+        ("assignee_role", constants.roles, "jira.yaml: assignees", jira.assignees),
+        ("assignee_role", constants.roles, "slack.yaml: users", slack.users),
+    ]
+
+    missing: list[str] = []
+    unknown: list[str] = []
+    empty_tables_reported: set[str] = set()
+    for table, values, label, mapping in pairs:
+        if not values and table not in empty_tables_reported:
+            missing.append(f"table {table} is empty; seed it before starting (db/extras.sql)")
+            empty_tables_reported.add(table)
+        missing.extend(
+            f"{label} has no entry for {table} value {value!r}"
+            for value in sorted(values - mapping.keys())
+        )
+        unknown.extend(
+            f"{label} maps {key!r}, which is not a value in table {table}"
+            for key in sorted(mapping.keys() - values)
+        )
+    return MappingReport(missing=missing, unknown=unknown)
+
+
+def ensure_mappings(constants: InternalConstants, configs: AdapterConfigs) -> None:
+    report = check_mappings(constants, configs)
+    for warning in report.unknown:
+        logger.warning("Adapter config: %s", warning)
+    if not report.ok:
+        details = "\n  - ".join(report.missing)
+        raise StartupCheckError(f"Adapter config does not cover the database:\n  - {details}")
+
+
+async def run_startup_checks(settings: Settings, engine: AsyncEngine) -> AdapterConfigs:
+    """Load adapter configs and verify they cover every internal value. Raises on failure."""
+    configs = load_adapter_configs(settings.jira_config_path, settings.slack_config_path)
+    constants = await load_internal_constants(engine)
+    ensure_mappings(constants, configs)
+    logger.info("Startup checks passed")
+    return configs

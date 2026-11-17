@@ -1,0 +1,33 @@
+# Jira adapter config. Copy to config/jira.yaml (git-ignored) and fill in real values.
+# Every internal value in the database constant tables must have an entry here,
+# otherwise the api and worker refuse to start.
+#
+# Credentials (base URL, email, API token) are NOT stored here; they come from env vars.
+
+project_key: OPS
+issue_type: Task
+
+# accountId of the account the system uses to call Jira.
+# Webhook events authored by this account are ignored to prevent sync loops.
+service_account_id: "000000:00000000-0000-0000-0000-000000000000"
+
+# internal status (document_record_status.status_name) -> Jira status name.
+# Must be one-to-one: inbound webhooks translate Jira status names back.
+statuses:
+  open: "To Do"
+  in_progress: "In Progress"
+  done: "Done"
+
+# internal urgency (ai_judgement_urgency.urgency_level_name) -> Jira priority name
+priorities:
+  critical: Highest
+  high: High
+  medium: Medium
+  low: Low
+
+# internal role (assignee_role.role_name) -> Jira accountId
+assignees:
+  backend: "000000:11111111-1111-1111-1111-111111111111"
+  frontend: "000000:22222222-2222-2222-2222-222222222222"
+  ops: "000000:33333333-3333-3333-3333-333333333333"
+  support: "000000:44444444-4444-4444-4444-444444444444"
