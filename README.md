@@ -1,5 +1,7 @@
 # issue-sync
 
+[![CI](https://github.com/Cjantwhy/issue-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/Cjantwhy/issue-sync/actions/workflows/ci.yml)
+
 Two-way sync between a Google Sheet and Jira Cloud, with AI triage and assignment.
 
 People report problems where they already work: a shared Google Sheet, or a Google Form
