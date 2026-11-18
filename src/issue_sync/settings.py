@@ -105,6 +105,21 @@ def _known_timezone(name: str) -> str:
     return name
 
 
+# The sheet-owned fields (issue_sync.sources.sheets.layout.SHEET_FIELDS); repeated here
+# to keep this module free of imports. A test checks that the two agree.
+SHEET_FIELD_NAMES = ("title", "description", "reporter", "contact")
+
+
+def _sheet_field_list(value: str) -> str:
+    names = [name.strip() for name in value.split(",") if name.strip()]
+    unknown = [name for name in names if name not in SHEET_FIELD_NAMES]
+    if unknown:
+        raise ValueError(
+            f"unknown field(s) {', '.join(unknown)}; choose from {', '.join(SHEET_FIELD_NAMES)}"
+        )
+    return ",".join(dict.fromkeys(names))
+
+
 def _divides_an_hour(minutes: int) -> int:
     if 1 <= minutes <= 60 and 60 % minutes == 0:
         return minutes
@@ -139,6 +154,11 @@ class Settings(DatabaseSettings, JiraSettings, GoogleSettings, LlmSettings, Slac
     sheets_poll_interval_seconds: Annotated[
         int, Field(ge=10), AfterValidator(_valid_poll_interval)
     ] = 60
+    # A new sheet row becomes a record only when these fields are filled in (those the
+    # worksheet has columns for) and its content has not changed for the settle period.
+    # A form submission skips the wait. 0 turns the wait off.
+    sheet_required_fields: Annotated[str, AfterValidator(_sheet_field_list)] = "title,description"
+    new_row_settle_seconds: int = Field(default=120, ge=0, le=3600)
     push_max_attempts: int = Field(default=8, ge=1, description="Ticket push attempts per job")
     # Reconciliation (missed webhooks, deleted rows, stuck pushes); must divide 60.
     reconcile_interval_minutes: Annotated[int, AfterValidator(_divides_an_hour)] = 15
@@ -151,6 +171,10 @@ class Settings(DatabaseSettings, JiraSettings, GoogleSettings, LlmSettings, Slac
     dashboard_password: SecretStr | None = Field(default=None, min_length=12)
     # Time zone for times shown on the dashboard and detail pages.
     display_timezone: Annotated[str, AfterValidator(_known_timezone)] = "UTC"
+
+    @property
+    def required_fields(self) -> tuple[str, ...]:
+        return tuple(name for name in self.sheet_required_fields.split(",") if name)
 
     @property
     def dashboard_enabled(self) -> bool:

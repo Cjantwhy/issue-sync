@@ -4,6 +4,9 @@ One run of `sync_document` reads the whole worksheet and, for each row:
 identity (system_id) -> change detection (raw_hash) -> record + history event.
 It returns the records that need a ticket push; the caller enqueues those jobs.
 
+A new row (no system_id yet) is taken only when it is complete and settled (see
+`settle.py`). Until then it gets no identity; a mapped Status cell says what is missing.
+
 Concurrency: a run holds a row lock on its `document` for its whole duration, so runs
 for the same worksheet (an Apps Script push racing the poll) are serialized. Each row is
 then written in its own short transaction under `SELECT ... FOR UPDATE` on the record.
@@ -11,9 +14,9 @@ then written in its own short transaction under `SELECT ... FOR UPDATE` on the r
 
 import logging
 import uuid
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from pydantic import ValidationError
@@ -39,6 +42,7 @@ from issue_sync.sources.sheets.layout import (
     content_hash,
     parse_sheet,
 )
+from issue_sync.sync.settle import NewRowPolicy, waiting_note
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +71,10 @@ class SyncReport:
     pending_record_ids: list[int] = field(default_factory=list)
     # Records with a ticket but no Slack notification yet: the caller enqueues one each.
     unnotified_record_ids: list[int] = field(default_factory=list)
+    # New rows not taken yet: incomplete, or still settling.
+    waiting: int = 0
+    # When the earliest settling row becomes ready: the caller schedules a run then.
+    recheck_at: datetime | None = None
 
 
 def detail_url(public_base_url: str, system_id: uuid.UUID) -> str:
@@ -103,18 +111,28 @@ class InboundSync:
         sessionmaker: async_sessionmaker[AsyncSession],
         sheets: SheetsSource,
         public_base_url: str,
+        *,
+        policy: NewRowPolicy | None = None,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._sessionmaker = sessionmaker
         self._sheets = sheets
         self._public_base_url = public_base_url
+        self._policy = policy or NewRowPolicy()
+        self._now = now
         self._last_unmapped: dict[int, list[str]] = {}
 
     @property
     def sheets(self) -> SheetsSource:
         return self._sheets
 
-    async def sync_document(self, document_id: int) -> SyncReport | None:
-        """Returns None if the document does not exist or has sync disabled."""
+    async def sync_document(
+        self, document_id: int, *, form_row: int | None = None
+    ) -> SyncReport | None:
+        """Returns None if the document does not exist or has sync disabled.
+
+        `form_row`: a form submission just wrote this row, so it need not settle.
+        """
         async with self._sessionmaker() as lock_session, lock_session.begin():
             # FOR NO KEY UPDATE, not FOR UPDATE: inserting records takes a KEY SHARE lock
             # on this row (foreign key check), which FOR UPDATE would block.
@@ -133,21 +151,24 @@ class InboundSync:
                 raise SheetLayoutError(
                     f"document {document_id} has an invalid mapping: {exc}"
                 ) from None
-            report = await self._sync_locked(document, mapping)
+            report = await self._sync_locked(document, mapping, form_row)
         logger.info(
             "synced document %s: %d created, %d modified, %d unchanged, %d skipped, "
-            "%d ids assigned, %d cells written",
+            "%d waiting, %d ids assigned, %d cells written",
             document_id,
             report.created,
             report.modified,
             report.unchanged,
             report.skipped,
+            report.waiting,
             report.ids_assigned,
             report.cells_written,
         )
         return report
 
-    async def _sync_locked(self, document: Document, mapping: DocumentMapping) -> SyncReport:
+    async def _sync_locked(
+        self, document: Document, mapping: DocumentMapping, form_row: int | None
+    ) -> SyncReport:
         report = SyncReport()
         values = await self._sheets.read_values(document.spreadsheet_id, document.worksheet_name)
         layout = parse_sheet(values, mapping)
@@ -186,10 +207,11 @@ class InboundSync:
         # Identity first: the UUID is in the sheet before any record exists, so a failure
         # later in the run cannot make the next run invent a second UUID for the row.
         written: dict[uuid.UUID, dict[str, str]] = {}
-        if new_rows:
-            assigned = await self._assign_ids(document, mapping, layout, new_rows)
+        ready, notes = await self._screen_new_rows(document, layout, new_rows, form_row, report)
+        if ready or notes:
+            assigned, count = await self._assign_ids(document, mapping, layout, ready, notes)
             report.ids_assigned = len(assigned)
-            report.cells_written += 2 * len(assigned)
+            report.cells_written += count
             for system_id, row in assigned.items():
                 identified[system_id] = row
                 written[system_id] = self._system_cells(system_id)
@@ -205,6 +227,48 @@ class InboundSync:
         report.unnotified_record_ids = await self._unnotified_records(document.id)
         return report
 
+    # ---------- new rows ----------
+
+    async def _screen_new_rows(
+        self,
+        document: Document,
+        layout: SheetLayout,
+        rows: list[SheetRow],
+        form_row: int | None,
+        report: SyncReport,
+    ) -> tuple[list[SheetRow], dict[int, str]]:
+        """Split new rows into those ready to be taken and those that wait.
+
+        Returns the ready rows, and the Status cell text for waiting rows whose cell
+        differs from it (row number -> text; "" clears an outdated note).
+        """
+        policy, now = self._policy, self._now()
+        ready: list[SheetRow] = []
+        notes: dict[int, str] = {}
+        for row in rows:
+            note = ""
+            missing = policy.missing(row, layout.columns)
+            if missing:
+                note = waiting_note(missing)
+            elif policy.settle > timedelta(0):
+                assert policy.clock is not None
+                if row.row_number == form_row:
+                    await policy.clock.mark_submitted(document.id, row.raw_hash)
+                seen = await policy.clock.first_seen(document.id, row.raw_hash, now)
+                ready_at = seen + policy.settle
+                if ready_at <= now:
+                    ready.append(row)
+                    continue
+                if report.recheck_at is None or ready_at < report.recheck_at:
+                    report.recheck_at = ready_at
+            else:
+                ready.append(row)
+                continue
+            report.waiting += 1
+            if "status" in layout.columns and row.system_cells.get("status", "") != note:
+                notes[row.row_number] = note
+        return ready, notes
+
     # ---------- identity ----------
 
     async def _assign_ids(
@@ -213,12 +277,15 @@ class InboundSync:
         mapping: DocumentMapping,
         layout: SheetLayout,
         new_rows: list[SheetRow],
-    ) -> dict[uuid.UUID, SheetRow]:
-        """Write fresh UUIDs (and detail links) into rows that have none.
+        notes: dict[int, str],
+    ) -> tuple[dict[uuid.UUID, SheetRow], int]:
+        """Write fresh UUIDs (and detail links) into ready rows, and the Status notes of
+        waiting rows. Returns the claimed rows and the number of cells written.
 
         The sheet is re-read just before writing, and a row is only claimed if it is
         still at the same position with the same content and an empty system_id cell.
         This guards against rows shifting (insert, delete, sort) since the first read.
+        Waiting rows' notes get the same check.
         """
         fresh = parse_sheet(
             await self._sheets.read_values(document.spreadsheet_id, document.worksheet_name),
@@ -226,8 +293,9 @@ class InboundSync:
         )
         if fresh.columns != layout.columns:
             logger.warning("document %s: columns moved during sync; ids deferred", document.id)
-            return {}
+            return {}, 0
         current = {row.row_number: row for row in fresh.rows}
+        by_number = {row.row_number: row for row in layout.rows}
         assigned: dict[uuid.UUID, SheetRow] = {}
         cells: list[CellWrite] = []
         for row in new_rows:
@@ -249,8 +317,13 @@ class InboundSync:
                     detail_url(self._public_base_url, system_id),
                 ),
             ]
+        for row_number, note in notes.items():
+            now = current.get(row_number)
+            if now is None or now.system_id_cell or now.raw_hash != by_number[row_number].raw_hash:
+                continue  # moved or edited meanwhile: the next run looks at it again
+            cells.append(CellWrite(row_number, layout.columns["status"], note))
         await self._sheets.write_cells(document.spreadsheet_id, document.worksheet_name, cells)
-        return assigned
+        return assigned, len(cells)
 
     def _system_cells(self, system_id: uuid.UUID) -> dict[str, str]:
         return {

@@ -16,14 +16,20 @@ def queued() -> list[int]:
 
 
 @pytest.fixture
-def client(queued: list[int]) -> TestClient:
+def form_rows() -> list[int | None]:
+    return []
+
+
+@pytest.fixture
+def client(queued: list[int], form_rows: list[int | None]) -> TestClient:
     app = create_app(make_settings(sheets_webhook_secret=SECRET))
 
     async def find(spreadsheet_id: str, worksheet_name: str) -> tuple[int, bool] | None:
         return DOCUMENTS.get((spreadsheet_id, worksheet_name))
 
-    async def enqueue(document_id: int) -> None:
+    async def enqueue(document_id: int, form_row: int | None) -> None:
         queued.append(document_id)
+        form_rows.append(form_row)
 
     app.dependency_overrides[webhooks.get_document_finder] = lambda: find
     app.dependency_overrides[webhooks.get_sync_enqueuer] = lambda: enqueue
@@ -63,6 +69,28 @@ def test_disabled_document_is_ignored(client: TestClient, queued: list[int]) -> 
     assert response.status_code == 202
     assert response.json() == {"status": "ignored"}
     assert queued == []
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ({}, None),
+        ({"source": "edit", "row": 5}, None),  # only a form submission names its row
+        ({"source": "change"}, None),
+        ({"source": "form", "row": 5}, 5),
+        ({"source": "form"}, None),
+    ],
+)
+def test_form_submission_passes_its_row(
+    client: TestClient, form_rows: list[int | None], extra: dict, expected: int | None
+) -> None:
+    assert _post(client, {**EVENT, **extra}).status_code == 202
+    assert form_rows == [expected]
+
+
+@pytest.mark.parametrize("extra", [{"source": "other"}, {"source": "form", "row": 1}])
+def test_invalid_source_or_row_is_422(client: TestClient, extra: dict) -> None:
+    assert _post(client, {**EVENT, **extra}).status_code == 422
 
 
 def test_malformed_body_is_422(client: TestClient) -> None:

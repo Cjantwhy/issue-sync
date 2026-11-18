@@ -15,7 +15,7 @@ Jobs:
 """
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, ClassVar
 
 import httpx
@@ -38,6 +38,7 @@ from issue_sync.sync.notify import Notifier, notify_record
 from issue_sync.sync.push import Triage, push_record
 from issue_sync.sync.reconcile import Reconciler
 from issue_sync.sync.retry import poll_schedule, retry_delay
+from issue_sync.sync.settle import NewRowPolicy, RedisRowClock
 from issue_sync.sync.ticket_events import apply_ticket_event
 from issue_sync.tickets.base import TicketBackendError
 from issue_sync.tickets.jira.backend import JiraBackend, create_jira_client
@@ -75,7 +76,14 @@ async def startup(ctx: dict[str, Any]) -> None:
             max_attempts=settings.llm_max_attempts,
         ),
         inbound=InboundSync(
-            sessionmaker, create_sheets_client(settings, http), str(settings.public_base_url)
+            sessionmaker,
+            create_sheets_client(settings, http),
+            str(settings.public_base_url),
+            policy=NewRowPolicy(
+                required_fields=settings.required_fields,
+                settle=timedelta(seconds=settings.new_row_settle_seconds),
+                clock=RedisRowClock(ctx["redis"]),
+            ),
         ),
     )
     slack = create_slack_client(settings, http)
@@ -125,9 +133,25 @@ async def poll_documents(ctx: dict[str, Any]) -> int:
     return len(ids)
 
 
-async def sync_document(ctx: dict[str, Any], document_id: int) -> dict[str, int] | None:
+async def schedule_recheck(ctx: dict[str, Any], document_id: int, at: datetime) -> None:
+    """Sync again when a settling row becomes ready, instead of waiting for the poll.
+
+    The job id names the moment, so the many syncs one row's edits trigger schedule
+    a single run for it.
+    """
+    await ctx["redis"].enqueue_job(
+        "sync_document",
+        document_id,
+        _job_id=f"settle:{document_id}:{int(at.timestamp())}",
+        _defer_until=at + timedelta(seconds=1),
+    )
+
+
+async def sync_document(
+    ctx: dict[str, Any], document_id: int, form_row: int | None = None
+) -> dict[str, int] | None:
     try:
-        report = await ctx["inbound"].sync_document(document_id)
+        report = await ctx["inbound"].sync_document(document_id, form_row=form_row)
     except SheetsError as exc:
         delay = retry_delay(
             retryable=exc.retryable,
@@ -149,9 +173,12 @@ async def sync_document(ctx: dict[str, Any], document_id: int) -> dict[str, int]
         await ctx["redis"].enqueue_job("push_ticket", record_id)
     for record_id in report.unnotified_record_ids:
         await enqueue_notify(ctx, record_id)
+    if report.recheck_at is not None:
+        await schedule_recheck(ctx, document_id, report.recheck_at)
     return {
         "created": report.created,
         "modified": report.modified,
+        "waiting": report.waiting,
         "pushes_enqueued": len(report.pending_record_ids),
         "notifications_enqueued": len(report.unnotified_record_ids),
     }

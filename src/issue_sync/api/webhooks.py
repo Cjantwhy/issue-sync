@@ -36,7 +36,8 @@ SECRET_HEADER = "X-Issue-Sync-Secret"
 
 # (spreadsheet_id, worksheet_name) -> (document id, sync_enabled), or None if unknown
 DocumentFinder = Callable[[str, str], Awaitable[tuple[int, bool] | None]]
-Enqueue = Callable[[int], Awaitable[None]]
+# (document id, row a form submission just wrote or None)
+Enqueue = Callable[[int, int | None], Awaitable[None]]
 EnqueueEvent = Callable[[dict[str, Any]], Awaitable[None]]
 
 MAX_JIRA_BODY_BYTES = 2_000_000
@@ -45,6 +46,13 @@ MAX_JIRA_BODY_BYTES = 2_000_000
 class SheetsEvent(BaseModel):
     spreadsheet_id: str = Field(min_length=1, max_length=255)
     worksheet_name: str = Field(min_length=1, max_length=255)
+    # "form": a form submission wrote `row` in one go, so it need not settle.
+    source: Literal["edit", "change", "form"] = "edit"
+    row: int | None = Field(default=None, ge=2, le=10_000_000)
+
+    @property
+    def form_row(self) -> int | None:
+        return self.row if self.source == "form" else None
 
 
 class WebhookResponse(BaseModel):
@@ -82,8 +90,8 @@ def get_document_finder(request: Request) -> DocumentFinder:
 def get_sync_enqueuer(request: Request) -> Enqueue:
     redis = request.app.state.redis
 
-    async def enqueue(document_id: int) -> None:
-        await redis.enqueue_job("sync_document", document_id)
+    async def enqueue(document_id: int, form_row: int | None) -> None:
+        await redis.enqueue_job("sync_document", document_id, form_row)
 
     return enqueue
 
@@ -104,7 +112,7 @@ async def sheets_webhook(
     document_id, enabled = found
     if not enabled:
         return WebhookResponse(status="ignored")
-    await enqueue_sync(document_id)
+    await enqueue_sync(document_id, event.form_row)
     return WebhookResponse(status="queued")
 
 

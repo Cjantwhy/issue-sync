@@ -349,3 +349,21 @@ One entry per trade-off: context, what was chosen, and why not the alternative.
 
 ### Times shown in one configured zone
 - **Chosen:** `DISPLAY_TIMEZONE` (IANA name, default UTC), checked at startup. The database and the sheet's "latest note" keep using UTC. `tzdata` is a dependency so zone names work on Windows and in slim images alike.
+
+## Fix — New rows are taken only when complete and settled
+
+### Why
+- **Context:** People type a row one cell at a time, and every cell edit triggers a sync. The first sync after the title was typed would create the record, triage it with the AI and open the ticket from the title alone. Later cells update the ticket's content, but the judgement (urgency, team) is made once, at creation. Polling has the same problem whenever it happens to run mid-typing.
+
+### Chosen
+- A row without a System ID becomes a record only when it is **complete** (`SHEET_REQUIRED_FIELDS`, default title and description; a field the worksheet has no column for is not required there) and **settled** (unchanged for `NEW_ROW_SETTLE_SECONDS`, default 120; 0 turns it off). Until then it gets no identity at all, so nothing downstream sees a half row.
+- The wait is tracked per row *content*: Redis keeps when each (document, row hash) was first seen. Editing a cell gives a new hash and restarts the wait; sorting or inserting rows does not. The hash already excludes system-owned columns. Losing Redis only makes a row wait one more period, so no schema change is needed.
+- A sync that leaves rows settling schedules one more sync for the moment the earliest becomes ready (job id per document and moment, so a burst of edits schedules one run). The poll remains the fallback.
+- **Form submissions skip the wait.** The Apps Script `onFormSubmit` trigger fires only for form submissions, which write the whole row at once; it sends the row number, and the sync marks that row's current content as settled. Required fields still apply (forms can have optional questions). If the row moved or changed before the sync, the normal wait applies. The webhook is authenticated, and a forged "form" event could only save a row its wait.
+- A mapped Status column tells people what is missing ("Waiting for: Description"), written with the same re-check as System IDs so a moved row never gets someone else's note. A row that is complete and only settling shows nothing; the wait is short.
+- Rows that already have a record are not held back: their edits sync at once, since triage has already happened.
+
+### Not chosen
+- **Detecting form rows from the data** (a "Timestamp" first column): a heading anyone can type, and localized.
+- **Debouncing in Apps Script** (e.g. waiting in the trigger): triggers cannot hold state reliably, and the poll would still take half rows.
+- **Re-triaging after edits**: the ticket and its Slack notification would already be out, possibly to the wrong team.

@@ -32,6 +32,7 @@ from issue_sync.sync.inbound import InboundSync
 from issue_sync.sync.notify import Notifier, notify_record
 from issue_sync.sync.push import Triage, push_record
 from issue_sync.sync.reconcile import Reconciler
+from issue_sync.sync.settle import NewRowPolicy
 from issue_sync.sync.ticket_events import apply_ticket_event
 from issue_sync.tickets.base import (
     TicketBackendUnavailable,
@@ -1328,3 +1329,189 @@ async def test_stuck_pushes_are_requeued_until_the_limit_then_reported(
         ("notification_missing", "ticket:OPS-3"),
         ("push_failed", f"record:{second}"),
     ]
+
+
+# ---------- new rows: taken only when complete and settled ----------
+
+SETTLE = timedelta(seconds=120)
+T_START = datetime(2026, 11, 18, 9, 0, tzinfo=UTC)
+
+
+class FakeRowClock:
+    def __init__(self) -> None:
+        self.seen: dict[tuple[int, str], datetime] = {}
+
+    async def first_seen(self, document_id: int, raw_hash: str, now: datetime) -> datetime:
+        return self.seen.setdefault((document_id, raw_hash), now)
+
+    async def mark_submitted(self, document_id: int, raw_hash: str) -> None:
+        self.seen[(document_id, raw_hash)] = datetime(2000, 1, 1, tzinfo=UTC)
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = T_START
+
+    def advance(self, seconds: int) -> None:
+        self.now += timedelta(seconds=seconds)
+
+
+@pytest.fixture
+def clock() -> Clock:
+    return Clock()
+
+
+def _settling(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    sheet: FakeSheet,
+    clock: Clock,
+    required: tuple[str, ...] = ("title", "description"),
+) -> InboundSync:
+    policy = NewRowPolicy(required_fields=required, settle=SETTLE, clock=FakeRowClock())
+    return InboundSync(sessionmaker, sheet, BASE_URL, policy=policy, now=lambda: clock.now)
+
+
+async def _tracked_document(sessionmaker: async_sessionmaker[AsyncSession]) -> int:
+    return await _add_document(sessionmaker, worksheet="Tracked", mapping=MAPPING_WB)
+
+
+async def test_incomplete_row_waits_and_says_why(
+    sessionmaker: async_sessionmaker[AsyncSession], clock: Clock
+) -> None:
+    document_id = await _tracked_document(sessionmaker)
+    sheet = FakeSheet([HEADER_WB, ["Export fails"]])  # title typed, description not yet
+    sync = _settling(sessionmaker, sheet, clock)
+
+    first = await sync.sync_document(document_id)
+    clock.advance(600)
+    second = await sync.sync_document(document_id)
+
+    assert first is not None and second is not None
+    assert (first.created, first.waiting, first.recheck_at) == (0, 1, None)
+    assert sheet.cell(2, STATUS_COL) == "Waiting for: Description"
+    assert sheet.cell(2, SID_COL) == ""
+    assert (second.created, second.cells_written) == (0, 0)  # note already there
+    assert await _records(sessionmaker) == []
+
+    # Description filled in: the wait starts now, and the outdated note is cleared.
+    sheet.grid[1][1] = "Clicking export errors"
+    third = await sync.sync_document(document_id)
+    assert third is not None
+    assert (third.created, third.waiting, third.recheck_at) == (0, 1, clock.now + SETTLE)
+    assert sheet.cell(2, STATUS_COL) == ""
+
+    clock.advance(119)
+    assert (await sync.sync_document(document_id)).created == 0  # type: ignore[union-attr]
+    clock.advance(1)
+    done = await sync.sync_document(document_id)
+    assert done is not None and (done.created, done.waiting, done.recheck_at) == (1, 0, None)
+    record = (await _records(sessionmaker))[0]
+    assert (record.title, record.description) == ("Export fails", "Clicking export errors")
+    assert sheet.cell(2, SID_COL) == str(record.system_id)
+    assert [e for _, e in await _events(sessionmaker)] == ["created"]  # no half-row history
+
+
+async def test_editing_restarts_the_wait(
+    sessionmaker: async_sessionmaker[AsyncSession], clock: Clock
+) -> None:
+    document_id = await _tracked_document(sessionmaker)
+    sheet = FakeSheet([HEADER_WB, ["Export fails", "Errors"]])
+    sync = _settling(sessionmaker, sheet, clock)
+    await sync.sync_document(document_id)
+
+    clock.advance(100)
+    sheet.grid[1][1] = "Errors on every CSV export since Monday"
+    edited = await sync.sync_document(document_id)
+    clock.advance(30)  # 130 s since the row appeared, 30 s since the edit
+    early = await sync.sync_document(document_id)
+    clock.advance(90)
+    late = await sync.sync_document(document_id)
+
+    assert edited is not None and edited.recheck_at == T_START + timedelta(seconds=100) + SETTLE
+    assert early is not None and early.created == 0
+    assert late is not None and late.created == 1
+    assert (await _records(sessionmaker))[0].description.startswith("Errors on every")  # type: ignore[union-attr]
+
+
+async def test_moving_a_row_keeps_its_wait(
+    sessionmaker: async_sessionmaker[AsyncSession], clock: Clock
+) -> None:
+    document_id = await _tracked_document(sessionmaker)
+    sheet = FakeSheet([HEADER_WB, ["Export fails", "Errors"]])
+    sync = _settling(sessionmaker, sheet, clock)
+    await sync.sync_document(document_id)
+
+    sheet.grid.insert(1, ["Login slow"])  # a new, incomplete row above it
+    clock.advance(120)
+    report = await sync.sync_document(document_id)
+
+    assert report is not None and (report.created, report.waiting) == (1, 1)
+    assert sheet.cell(3, SID_COL) == str((await _records(sessionmaker))[0].system_id)
+    assert sheet.cell(2, STATUS_COL) == "Waiting for: Description"
+
+
+async def test_form_submission_is_taken_at_once(
+    sessionmaker: async_sessionmaker[AsyncSession], clock: Clock
+) -> None:
+    document_id = await _tracked_document(sessionmaker)
+    sheet = FakeSheet(
+        [HEADER_WB, ["Typed by hand", "Details"], ["From the form", "Details"], ["Form", ""]]
+    )
+    sync = _settling(sessionmaker, sheet, clock)
+
+    report = await sync.sync_document(document_id, form_row=3)
+    incomplete = await sync.sync_document(document_id, form_row=4)
+    nowhere = await sync.sync_document(document_id, form_row=9)
+
+    assert report is not None and (report.created, report.waiting) == (1, 2)
+    assert [r.title for r in await _records(sessionmaker)] == ["From the form"]
+    # Required fields still apply to forms (optional questions can be left blank).
+    assert incomplete is not None and incomplete.created == 0
+    assert sheet.cell(4, STATUS_COL) == "Waiting for: Description"
+    # A row number that does not match a waiting row changes nothing.
+    assert nowhere is not None and nowhere.created == 0
+
+
+async def test_field_without_a_column_is_not_required(
+    sessionmaker: async_sessionmaker[AsyncSession], clock: Clock
+) -> None:
+    mapping = {k: v for k, v in MAPPING.items() if k != "description"}
+    document_id = await _add_document(sessionmaker, worksheet="Short", mapping=mapping)
+    sheet = FakeSheet([["Title", "Reporter", "System ID", "Detail link"], ["Export fails"]])
+
+    report = await _settling(sessionmaker, sheet, clock).sync_document(document_id, form_row=2)
+
+    assert report is not None and report.created == 1
+
+
+async def test_existing_records_are_not_held_back(
+    sessionmaker: async_sessionmaker[AsyncSession], clock: Clock
+) -> None:
+    # The checks guard creation only; later edits sync at once, even an emptied field.
+    document_id = await _tracked_document(sessionmaker)
+    sheet = FakeSheet([HEADER_WB, ["Export fails", "Errors"]])
+    sync = _settling(sessionmaker, sheet, clock)
+    await sync.sync_document(document_id, form_row=2)
+
+    sheet.grid[1][1] = ""
+    report = await sync.sync_document(document_id)
+
+    assert report is not None and (report.modified, report.waiting) == (1, 0)
+    assert (await _records(sessionmaker))[0].description is None
+
+
+async def test_note_is_not_written_into_a_row_that_moved(
+    sessionmaker: async_sessionmaker[AsyncSession], clock: Clock
+) -> None:
+    document_id = await _tracked_document(sessionmaker)
+    sheet = FakeSheet([HEADER_WB, ["Export fails"]])
+
+    def insert_above(read: int) -> None:
+        if read == 2:  # between the first read and the re-check before writing
+            sheet.grid.insert(1, ["Someone else's row", "Details"])
+
+    sheet.on_read = insert_above
+    report = await _settling(sessionmaker, sheet, clock).sync_document(document_id)
+
+    assert report is not None and report.cells_written == 0
+    assert sheet.cell(2, STATUS_COL) == ""
