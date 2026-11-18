@@ -9,12 +9,14 @@ from contextlib import asynccontextmanager
 from arq import create_pool
 from arq.connections import RedisSettings
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from issue_sync.api import health, webhooks
 from issue_sync.db.session import create_engine, create_sessionmaker
 from issue_sync.log_setup import configure_logging
 from issue_sync.settings import Settings, get_settings
 from issue_sync.startup_checks import run_startup_checks
+from issue_sync.web import routes as pages
 
 
 def _lifespan(settings: Settings):
@@ -52,4 +54,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.include_router(health.router)
     app.include_router(webhooks.router)
+    app.include_router(pages.router)
+    app.mount("/static", StaticFiles(directory=pages.STATIC_DIR), name="static")
     return app

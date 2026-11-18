@@ -87,7 +87,7 @@ def test_concurrent_upgrades_serialize(database_url: str) -> None:
     for proc in procs:
         output, _ = proc.communicate(timeout=120)
         assert proc.returncode == 0, output
-    assert _current_revision(database_url) == "0002"
+    assert _current_revision(database_url) == "0003"
 
 
 def test_orm_models_match_migrated_schema(database_url: str) -> None:

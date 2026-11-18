@@ -83,6 +83,7 @@ async def apply_state(
     """
     record.current_priority = state.priority
     record.current_assignee = state.assignee_name
+    record.current_assignee_id = state.assignee_id
     if state.status is None:
         logger.warning(
             "record %s: Jira status %r has no mapping in jira.yaml; status left unchanged",
@@ -129,6 +130,7 @@ async def apply_snapshot(
         )
         record.current_priority = state.priority
         record.current_assignee = state.assignee_name
+        record.current_assignee_id = state.assignee_id
         return True
     return await apply_state(session, record, state, actor="jira")
 

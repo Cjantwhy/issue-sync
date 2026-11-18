@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  {% block meta %}{% endblock %}
+  <title>{% block title %}issue-sync{% endblock %}</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <header class="topbar">
+    <span class="brand">issue-sync</span>
+    {% block nav %}{% endblock %}
+  </header>
+  <main class="{% block main_class %}narrow{% endblock %}">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="foot">Times in {{ timezone }}</footer>
+</body>
+</html>

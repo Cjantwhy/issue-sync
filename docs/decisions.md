@@ -322,3 +322,30 @@ One entry per trade-off: context, what was chosen, and why not the alternative.
 
 ### Alerts: one message per run, each problem at most daily
 - **Chosen:** Problems found in one run are posted as one Slack message to `alert_channel` (default: the triage channel), escaped like every other message. Each problem (kind + subject) is posted at most once per 24 hours. The "already posted" marks are Redis keys with a TTL, written only after Slack accepted the message, so a failed post is retried on the next run. Losing Redis costs at most one repeated alert, so no database column is needed. Alerts are also written to the worker log.
+
+## Milestone 8 — Dashboard and detail page
+
+### Two schema additions, so the comparison is exact
+- **Context:** The dashboard compares the AI judgement with the ticket as it is now. Two facts were missing: who the assignee is as an account (only the display name was stored, while roles map to account ids), and what the assignment rules decided when the ticket was created (only a Jira comment said so).
+- **Chosen (migration 0003):** `document_record.current_assignee_id`, written wherever `current_assignee` is; `ticket_sync.assigned_urgency_id`, `assigned_role_id` and `assignment_rule`, written once when the ticket is created and never again. Both are internal values or the ticket system's own id, no translated fields.
+- **Not chosen:** Looking up configured account ids' display names in Jira at page time and comparing names: an extra API dependency for every page, and two people with the same name would compare equal. Recomputing rule results from today's `assignment.yaml`: rules change, and old tickets would be judged by rules that did not exist when they were created.
+- **Existing rows:** Left NULL rather than reconstructed. Reconciliation fills in a missing assignee id when the ticket's assignee has the same name as the stored one (the same person, so no state moves). Without a recorded assignment, the AI suggestion is the baseline, so such tickets show only "matches AI" or "changed". A ticket found by its label after a lost create response ("linked") has no recorded assignment either.
+
+### One verdict, computed in SQL
+- **Chosen:** Per field (priority, assignee): *agree* (the ticket has the AI's value, translated through `jira.yaml`), *rule* (a rule changed it at creation and the ticket still has the rule's value), *human* (anything else, including an unassigned ticket), *unknown* (an assignee name without an id), *none* (no judgement, or the ticket state was never read). The expression is built once from the Jira config and used for the badges, the filter and the per-model statistics, so the three cannot disagree, and filtering and paging stay in the database.
+- The newest judgement is the one compared (`DISTINCT ON`), consistent with the rest of the system; older ones are listed on the detail page.
+
+### Dashboard behind HTTP Basic; off unless configured
+- **Chosen:** `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD` (at least 12 characters), compared in constant time. Without both, `/dashboard` answers 404, so a deployment that forgot them never serves an open list of every request. Only `/r/*` and `/static/*` are meant to be routed through the tunnel; the dashboard stays on the private network.
+- **Not chosen:** A login form with sessions and CSRF protection: more code for one internal page with a handful of users. It can replace Basic later without touching the pages.
+
+### Public detail page: what it shows and what it does not
+- **Chosen:** Anyone with the link can read it, and the random UUID is the only key, so it shows what the requester and the team need (description, AI triage and reasoning, status history, comments, attachment links) but never the contact field, including old and new values in the edit history. The same 404 page answers malformed and unknown ids. Pages send `X-Robots-Tag: noindex`, `Referrer-Policy: no-referrer` (the UUID must not leak to linked sites) and `Cache-Control: no-store`.
+- Attachment links are rendered only for http(s) URLs, so a `javascript:` URL stored in an event cannot run. Everything else relies on Jinja2's autoescaping.
+
+### HTMX served from the app, strict CSP
+- **Chosen:** htmx 2.0.4 is vendored under `/static`; the Content-Security-Policy allows scripts and styles from the app's own origin only, with no inline code (htmx's injected indicator styles are turned off). Filters are a plain GET form: htmx swaps only the results and pushes the URL, so filtered views can be bookmarked, and the form still works without JavaScript. A history restore after a cache miss gets the full page.
+- **Not chosen:** Loading htmx from a CDN: one more third-party origin in the CSP and in every page view, for a 50 KB file.
+
+### Times shown in one configured zone
+- **Chosen:** `DISPLAY_TIMEZONE` (IANA name, default UTC), checked at startup. The database and the sheet's "latest note" keep using UTC. `tzdata` is a dependency so zone names work on Windows and in slim images alike.

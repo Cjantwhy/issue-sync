@@ -225,3 +225,6 @@ config/*.yaml
 
 # Google service account key and other secret files
 secrets/
+
+# Browser automation output (local QA screenshots)
+.playwright-mcp/

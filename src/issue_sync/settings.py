@@ -8,6 +8,7 @@ the `jira-check` command) do not require the rest.
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import AfterValidator, AnyHttpUrl, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -94,6 +95,16 @@ class SlackSettings(_EnvSettings):
     )
 
 
+def _known_timezone(name: str) -> str:
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ValueError(
+            f"unknown time zone {name!r} (use an IANA name like Asia/Shanghai)"
+        ) from None
+    return name
+
+
 def _divides_an_hour(minutes: int) -> int:
     if 1 <= minutes <= 60 and 60 % minutes == 0:
         return minutes
@@ -133,6 +144,17 @@ class Settings(DatabaseSettings, JiraSettings, GoogleSettings, LlmSettings, Slac
     reconcile_interval_minutes: Annotated[int, AfterValidator(_divides_an_hour)] = 15
     # Pushes or notifications stuck longer than this are re-queued or reported.
     reconcile_stale_minutes: int = Field(default=30, ge=5)
+
+    # Dashboard sign-in (HTTP Basic). Unset: the dashboard is off (404). The public
+    # detail pages need no sign-in.
+    dashboard_username: str | None = None
+    dashboard_password: SecretStr | None = Field(default=None, min_length=12)
+    # Time zone for times shown on the dashboard and detail pages.
+    display_timezone: Annotated[str, AfterValidator(_known_timezone)] = "UTC"
+
+    @property
+    def dashboard_enabled(self) -> bool:
+        return bool(self.dashboard_username and self.dashboard_password)
 
     @property
     def push_retry_limit(self) -> int:

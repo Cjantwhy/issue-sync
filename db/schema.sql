@@ -68,6 +68,7 @@ CREATE TABLE document_record (
     status_id           INTEGER REFERENCES document_record_status (id),
     current_priority    VARCHAR(255),
     current_assignee    VARCHAR(255),
+    current_assignee_id VARCHAR(255),                   -- the ticket system's account id of current_assignee
 
     -- Raw data and change detection
     raw                 JSONB,
@@ -126,6 +127,12 @@ CREATE TABLE ticket_sync (
     last_error          TEXT,
     retry_count         INTEGER NOT NULL DEFAULT 0,
     notified_at         TIMESTAMPTZ,                    -- Slack notification for the new ticket sent; NULL until sent
+
+    -- Assignment applied when the ticket was created: the AI judgement after the
+    -- assignment rules. NULL for linked tickets and tickets created before this was kept.
+    assigned_urgency_id INTEGER REFERENCES ai_judgement_urgency (id),
+    assigned_role_id    INTEGER REFERENCES assignee_role (id),
+    assignment_rule     VARCHAR(255),                   -- name of the matched rule; NULL if none matched
 
     -- Inbound from the ticket system
     ticket_updated_at     TIMESTAMPTZ,                    -- last ticket update; webhook events older than this are dropped

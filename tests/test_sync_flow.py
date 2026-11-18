@@ -766,6 +766,66 @@ async def test_rule_overrides_ai_team_and_explains_it_in_a_comment(
     assert role == "backend"
 
 
+async def _assignment(
+    sessionmaker: async_sessionmaker[AsyncSession], record_id: int
+) -> tuple[str | None, str | None, str | None]:
+    async with sessionmaker() as session:
+        row = (
+            await session.execute(
+                text(
+                    "SELECT u.urgency_level_name, r.role_name, t.assignment_rule "
+                    "FROM ticket_sync t "
+                    "LEFT JOIN ai_judgement_urgency u ON u.id = t.assigned_urgency_id "
+                    "LEFT JOIN assignee_role r ON r.id = t.assigned_role_id "
+                    "WHERE t.document_record_id = :id"
+                ),
+                {"id": record_id},
+            )
+        ).one()
+    return tuple(row)  # type: ignore[return-value]
+
+
+@pytest.mark.parametrize(
+    ("rules", "expected"),
+    [
+        (RULES, ("high", "ops", "Exports go to ops")),
+        (AssignmentConfig(), ("high", "backend", None)),
+    ],
+)
+async def test_assignment_at_creation_is_kept(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    document_id: int,
+    rules: AssignmentConfig,
+    expected: tuple[str | None, str | None, str | None],
+) -> None:
+    # Kept as decided then, so the dashboard never re-derives it from changed rules.
+    record_id = await _one_record(sessionmaker, document_id)
+    tickets = FakeTickets()
+    triage = Triage(FakeClassifier(JUDGEMENT))
+    await push_record(sessionmaker, tickets, record_id, BASE_URL, triage=triage, rules=rules)
+    assert await _assignment(sessionmaker, record_id) == expected
+
+    # Later pushes (content edits) do not touch it.
+    async with sessionmaker() as session, session.begin():
+        await session.execute(text("UPDATE document_record SET title = 'Export fails (CSV)'"))
+    await push_record(sessionmaker, tickets, record_id, BASE_URL, rules=AssignmentConfig())
+    assert await _assignment(sessionmaker, record_id) == expected
+
+
+async def test_linked_ticket_has_no_recorded_assignment(
+    sessionmaker: async_sessionmaker[AsyncSession], document_id: int
+) -> None:
+    # Found an existing ticket (a lost create response): its assignment is unknown.
+    record_id = await _one_record(sessionmaker, document_id)
+    tickets = FakeTickets()
+    tickets.lose_next_create_response = True
+    triage = Triage(FakeClassifier(JUDGEMENT))
+    await push_record(sessionmaker, tickets, record_id, BASE_URL, triage=triage, rules=RULES)
+    result = await push_record(sessionmaker, tickets, record_id, BASE_URL, triage=triage)
+    assert result.outcome == "linked"
+    assert await _assignment(sessionmaker, record_id) == (None, None, None)
+
+
 async def _ticketed_record(sessionmaker: async_sessionmaker[AsyncSession], document_id: int) -> int:
     record_id = await _one_record(sessionmaker, document_id)
     await push_record(
@@ -910,6 +970,7 @@ async def test_creation_reads_back_a_baseline_without_an_event(
     record = (await _records(sessionmaker))[0]
     assert await _status_of(sessionmaker, record_id) == "open"
     assert (record.current_priority, record.current_assignee) == ("High", "Olga Ops")
+    assert record.current_assignee_id == "acc-1"
     assert (await _ticket_sync(sessionmaker, record_id)).ticket_updated_at == TICKET_CREATED_AT
     assert [e for _, e in await _events(sessionmaker)] == ["created"]
     # The next sync run shows the initial status in the sheet.
@@ -1124,6 +1185,29 @@ async def test_ticket_without_baseline_gets_one_without_an_event(
     assert report.tickets_updated == 1
     assert await _status_of(sessionmaker, record_id) == "open"
     assert [e for _, e in await _events(sessionmaker)] == ["created"]
+
+
+async def test_missing_assignee_id_is_filled_in_without_a_ticket_change(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    # Records from before assignee ids were kept: name known, id not. The ticket has not
+    # changed since, so the id is taken from the same assignee without moving any state.
+    _, sheet, tickets, _ = await _tracked(sessionmaker, rows=2)
+    async with sessionmaker() as session, session.begin():
+        await session.execute(text("UPDATE document_record SET current_assignee_id = NULL"))
+        await session.execute(
+            text("UPDATE document_record SET current_assignee = 'Someone Else' WHERE id = 2")
+        )
+
+    report = await _reconciler(sessionmaker, tickets, sheet).run()
+
+    assert report.tickets_updated == 0
+    records = await _records(sessionmaker)
+    assert [(r.current_assignee, r.current_assignee_id) for r in records] == [
+        ("Olga Ops", "acc-1"),
+        ("Someone Else", None),  # a different name: left for the next real change
+    ]
+    assert [e for _, e in await _events(sessionmaker)] == ["created", "created"]
 
 
 async def test_content_edited_in_jira_is_queued_for_restore(

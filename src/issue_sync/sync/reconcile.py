@@ -167,6 +167,14 @@ class Reconciler:
                     sync.ticket_updated_at = ticket.updated_at
                 if before != (record.status_id, record.current_priority, record.current_assignee):
                     report.tickets_updated += 1
+            elif (
+                record.current_assignee_id is None
+                and ticket.assignee_id is not None
+                and record.current_assignee == ticket.assignee_name
+            ):
+                # Records from before assignee ids were kept: fill the id in without
+                # waiting for the ticket to change. Same person only, so no state moves.
+                record.current_assignee_id = ticket.assignee_id
 
             known = await recorded_comment_ids(session, record.id)
             for comment in sorted(ticket.comments, key=lambda c: c.created_at):

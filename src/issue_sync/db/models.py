@@ -166,6 +166,8 @@ class DocumentRecord(Base):
     status_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("document_record_status.id"))
     current_priority: Mapped[str | None] = mapped_column(String(255))
     current_assignee: Mapped[str | None] = mapped_column(String(255))
+    # The ticket system's account id of current_assignee (the name is for display).
+    current_assignee_id: Mapped[str | None] = mapped_column(String(255))
 
     # Raw data and change detection
     raw: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
@@ -286,6 +288,13 @@ class TicketSync(Base):
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     # When the Slack notification for the new ticket was sent; NULL until then.
     notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Assignment applied when the ticket was created (AI judgement after the assignment
+    # rules). NULL for linked tickets and tickets created before it was kept.
+    assigned_urgency_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("ai_judgement_urgency.id")
+    )
+    assigned_role_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("assignee_role.id"))
+    assignment_rule: Mapped[str | None] = mapped_column(String(255))  # matched rule's name
 
     # Inbound from the ticket system
     ticket_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

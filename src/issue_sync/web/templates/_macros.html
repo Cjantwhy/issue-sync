@@ -1,0 +1,26 @@
+{% macro status_badge(status, terminal) -%}
+  {%- if status -%}
+    <span class="badge status-{{ status }}{% if terminal %} terminal{% endif %}">{{ status | humanize }}</span>
+  {%- else -%}
+    <span class="muted">—</span>
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro verdict_badge(verdict) -%}
+  {%- if verdict == "agree" -%}<span class="verdict agree" title="The ticket still has the AI's suggestion">Matches AI</span>
+  {%- elif verdict == "rule" -%}<span class="verdict rule" title="An assignment rule changed the AI's suggestion when the ticket was created">Rule</span>
+  {%- elif verdict == "human" -%}<span class="verdict human" title="Changed in Jira by a person">Changed</span>
+  {%- elif verdict == "unknown" -%}<span class="verdict unknown" title="Recorded before assignee ids were kept; filled in by the next update">Unknown</span>
+  {%- endif -%}
+{%- endmacro %}
+
+{# One field of the AI-vs-ticket comparison: the AI value, the rule's value when it
+   differed, and the ticket's current value. #}
+{% macro compare(ai, rule_value, current, verdict) -%}
+  <div class="compare">
+    {%- if ai %}<div><span class="k">AI</span> {{ ai }}</div>{% endif %}
+    {%- if rule_value and rule_value != ai %}<div><span class="k">Rule</span> {{ rule_value }}</div>{% endif %}
+    <div><span class="k">Jira</span> {{ current or "—" }}</div>
+    {%- if verdict not in ("none", None) %}<div>{{ verdict_badge(verdict) }}</div>{% endif %}
+  </div>
+{%- endmacro %}

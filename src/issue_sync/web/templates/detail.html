@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+{% from "_macros.html" import status_badge, verdict_badge %}
+{% block title %}{{ r.title or "Request" }} · issue-sync{% endblock %}
+{% block content %}
+<article class="detail">
+  <header class="detail-head">
+    <h1>{{ r.title or "(no title)" }}</h1>
+    <div class="meta">
+      {{ status_badge(r.status, r.status_terminal) }}
+      {% if r.issue_key %}<a href="{{ jira_url(r.issue_key) }}" rel="noreferrer noopener" target="_blank">{{ r.issue_key }}</a>{% endif %}
+      <span class="muted">Submitted {{ fmt_time(r.create_time) }}{% if d.reporter %} by {{ d.reporter }}{% endif %}</span>
+      {% if r.source_deleted_at %}<span class="badge warn">Row deleted from the sheet</span>{% endif %}
+    </div>
+  </header>
+
+  <section>
+    <h2>Request</h2>
+    {% if d.description %}<div class="text">{{ d.description }}</div>{% else %}<p class="muted">No description.</p>{% endif %}
+  </section>
+
+  <section>
+    <h2>Triage</h2>
+    {% if d.judgements %}
+    {% set j = d.judgements[0] %}
+    <p class="summary">{{ j.summary }}</p>
+    <dl class="facts">
+      <dt>Category</dt><dd>{{ j.type | humanize }}</dd>
+      <dt>Why</dt><dd>{{ j.reason }}</dd>
+      <dt>Model</dt><dd><code>{{ j.model }}</code> · {{ fmt_time(j.create_time) }}</dd>
+    </dl>
+    {% else %}
+    <p class="muted">No AI judgement for this request.</p>
+    {% endif %}
+
+    <div class="table-wrap">
+    <table class="comparison">
+      <thead><tr><th></th><th>AI suggested</th><th>Set at creation</th><th>Jira now</th><th></th></tr></thead>
+      <tbody>
+        <tr>
+          <th scope="row">Priority</th>
+          <td>{{ r.ai_priority or "—" }}{% if r.ai_urgency %} <span class="muted small">({{ r.ai_urgency | humanize }})</span>{% endif %}</td>
+          <td>{{ r.assigned_priority or "—" }}</td>
+          <td>{{ r.current_priority or "—" }}</td>
+          <td>{{ verdict_badge(r.priority_verdict) }}</td>
+        </tr>
+        <tr>
+          <th scope="row">Assignee</th>
+          <td>{{ (r.ai_role | humanize) or "—" }}</td>
+          <td>{{ (r.assigned_role | humanize) or "—" }}</td>
+          <td>{{ r.current_assignee or "—" }}</td>
+          <td>{{ verdict_badge(r.assignee_verdict) }}</td>
+        </tr>
+      </tbody>
+    </table>
+    </div>
+    {% if r.assignment_rule %}<p class="hint">Assignment rule applied at creation: {{ r.assignment_rule }}</p>{% endif %}
+
+    {% if d.judgements | length > 1 %}
+    <details>
+      <summary>Earlier judgements ({{ d.judgements | length - 1 }})</summary>
+      <ul class="plain">
+      {% for j in d.judgements[1:] %}
+        <li>{{ fmt_time(j.create_time) }} · <code>{{ j.model }}</code> · {{ j.type | humanize }}, {{ j.urgency | humanize }}, {{ j.assignee_role | humanize }}
+          <div class="muted">{{ j.reason }}</div></li>
+      {% endfor %}
+      </ul>
+    </details>
+    {% endif %}
+  </section>
+
+  <section>
+    <h2>History</h2>
+    {% if d.timeline %}
+    <ol class="timeline">
+    {% for e in d.timeline %}
+      <li class="event event-{{ e.event_type }}">
+        <div class="when">{{ fmt_time(e.create_time) }}</div>
+        <div class="what">
+          {% if e.event_type == "created" %}
+            Submitted from the sheet
+          {% elif e.event_type == "status_changed" %}
+            Status {% if e.from_status %}{{ e.from_status | humanize }} → {% endif %}<strong>{{ e.to_status | humanize }}</strong>
+            <span class="muted">by {{ e.created_by }}</span>
+          {% elif e.event_type == "comment" %}
+            Comment <span class="muted">by {{ e.created_by }}</span>
+            {% if e.comment %}<div class="text">{{ e.comment }}</div>{% endif %}
+          {% elif e.event_type == "source_modified" %}
+            {% if e.detail.restored %}
+              Row restored to the sheet
+            {% else %}
+              Request edited in the sheet
+              {% set changes = e.detail.changes if e.detail.changes is mapping else {} %}
+              <ul class="changes">
+              {% for name in public_change_fields if name in changes %}
+                <li><span class="k">{{ name | humanize }}</span>
+                  <del>{{ changes[name].from or "(empty)" }}</del> → <ins>{{ changes[name].to or "(empty)" }}</ins></li>
+              {% endfor %}
+              </ul>
+            {% endif %}
+          {% elif e.event_type == "source_deleted" %}
+            Row removed from the sheet; the ticket is kept
+          {% else %}
+            {{ e.event_type | humanize }}
+          {% endif %}
+          {% if e.attachments %}
+          <ul class="attachments">
+            {% for a in e.attachments %}
+              {% set url = a.url | safe_url %}
+              <li>{% if url %}<a href="{{ url }}" rel="noreferrer noopener" target="_blank">{{ a.name or url }}</a>{% else %}{{ a.name }}{% endif %}</li>
+            {% endfor %}
+          </ul>
+          {% endif %}
+        </div>
+      </li>
+    {% endfor %}
+    </ol>
+    {% else %}
+    <p class="muted">No events yet.</p>
+    {% endif %}
+  </section>
+</article>
+{% endblock %}

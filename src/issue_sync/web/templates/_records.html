@@ -1,0 +1,49 @@
+{% from "_macros.html" import status_badge, compare %}
+<p class="count">{{ results.total }} record{{ "" if results.total == 1 else "s" }}</p>
+{% if results.rows %}
+<div class="table-wrap">
+<table class="records">
+  <thead>
+    <tr>
+      <th>Request</th><th>Status</th><th>Category</th>
+      <th>Priority</th><th>Assignee</th><th>Ticket</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in results.rows %}
+    <tr{% if r.source_deleted_at %} class="deleted"{% endif %}>
+      <td class="request">
+        <a href="/r/{{ r.system_id }}">{{ r.title or "(no title)" }}</a>
+        <div class="muted small">{{ r.document_name }} · {{ fmt_time(r.create_time) }}
+          {%- if r.source_deleted_at %} · <span class="badge warn">Row deleted</span>{% endif %}</div>
+      </td>
+      <td>{{ status_badge(r.status, r.status_terminal) }}</td>
+      <td>{{ (r.ai_type | humanize) or "—" }}</td>
+      <td>{{ compare(r.ai_priority, r.assigned_priority, r.current_priority, r.priority_verdict) }}</td>
+      <td>{{ compare(r.ai_role | humanize, r.assigned_role | humanize, r.current_assignee, r.assignee_verdict) }}</td>
+      <td>
+        {%- if r.issue_key %}<a href="{{ jira_url(r.issue_key) }}" rel="noreferrer noopener" target="_blank">{{ r.issue_key }}</a>{% endif %}
+        {%- if r.push_status == "failed" %} <span class="badge error">Sync failed</span>
+        {%- elif r.push_status == "pending" %} <span class="badge">Pending</span>{% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% if results.pages > 1 %}
+<nav class="pager" aria-label="Pages">
+  {% if results.page > 1 %}
+    {% set url = page_url(page=results.page - 1 if results.page > 2 else None) %}
+    <a href="{{ url }}" hx-get="{{ url }}" hx-target="#records" hx-push-url="true">← Newer</a>
+  {% endif %}
+  <span>Page {{ results.page }} of {{ results.pages }}</span>
+  {% if results.page < results.pages %}
+    {% set url = page_url(page=results.page + 1) %}
+    <a href="{{ url }}" hx-get="{{ url }}" hx-target="#records" hx-push-url="true">Older →</a>
+  {% endif %}
+</nav>
+{% endif %}
+{% else %}
+<p class="muted">No records match these filters.</p>
+{% endif %}

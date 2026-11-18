@@ -28,7 +28,7 @@ from issue_sync.db.models import (
     DocumentRecord,
     TicketSync,
 )
-from issue_sync.rules import RequestFacts, decide
+from issue_sync.rules import Assignment, RequestFacts, decide
 from issue_sync.sources.sheets.layout import content_hash
 from issue_sync.sync.inbound import detail_url
 from issue_sync.sync.ticket_events import apply_snapshot
@@ -135,6 +135,7 @@ async def push_record(
                     )
                     ref = await backend.create_ticket(draft)
                     outcome = "created"
+                    await _record_assignment(session, sync, assignment)
                     await _explain_rule(backend, ref.key, assignment.explain(note))
                 else:
                     await backend.update_content(ref.key, content)
@@ -161,6 +162,27 @@ def request_facts(record: DocumentRecord) -> RequestFacts:
     return RequestFacts(
         title=record.title, description=record.description, reporter=record.reporter
     )
+
+
+async def _record_assignment(
+    session: AsyncSession, sync: TicketSync, assignment: Assignment
+) -> None:
+    """Keep the assignment the ticket was created with, for the AI-vs-human comparison.
+
+    Stored as decided at this moment: the rules may change later, and recomputing them
+    would misattribute old tickets.
+    """
+    if assignment.urgency is not None:
+        sync.assigned_urgency_id = await session.scalar(
+            select(AiJudgementUrgency.id).where(
+                AiJudgementUrgency.urgency_level_name == assignment.urgency
+            )
+        )
+    if assignment.assignee_role is not None:
+        sync.assigned_role_id = await session.scalar(
+            select(AssigneeRole.id).where(AssigneeRole.role_name == assignment.assignee_role)
+        )
+    sync.assignment_rule = assignment.rule
 
 
 async def _explain_rule(backend: TicketBackend, key: str, explanation: str | None) -> None:

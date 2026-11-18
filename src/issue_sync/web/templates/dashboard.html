@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block meta %}<meta name="htmx-config" content='{"includeIndicatorStyles": false}'>{% endblock %}
+{% block title %}Dashboard · issue-sync{% endblock %}
+{% block head %}<script src="/static/htmx-2.0.4.min.js" defer></script>{% endblock %}
+{% block nav %}<span class="muted">Dashboard</span>{% endblock %}
+{% block main_class %}wide{% endblock %}
+{% block content %}
+<section class="stats" aria-labelledby="stats-title">
+  <h2 id="stats-title">AI suggestion vs. the ticket today</h2>
+  {% if stats %}
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th rowspan="2">Model</th><th rowspan="2" class="num">Tickets</th>
+        <th colspan="3" class="group">Priority</th><th colspan="3" class="group">Assignee</th>
+      </tr>
+      <tr>
+        <th class="num">Matches AI</th><th class="num">Rule</th><th class="num">Changed</th>
+        <th class="num">Matches AI</th><th class="num">Rule</th><th class="num">Changed</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for s in stats %}
+      <tr>
+        <td><code>{{ s.model }}</code></td>
+        <td class="num">{{ s.compared }}</td>
+        {% for field in (s.priority, s.assignee) %}
+          {% set n = field.agree + field.rule + field.human %}
+          <td class="num">{{ field.agree }}{% if n %} <span class="muted">({{ (100 * field.agree / n) | round | int }}%)</span>{% endif %}</td>
+          <td class="num">{{ field.rule }}</td>
+          <td class="num">{{ field.human }}</td>
+        {% endfor %}
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <p class="hint">Matches AI: the ticket still has what the AI suggested. Rule: an assignment rule overrode it when the ticket was created. Changed: someone changed it in Jira afterwards.</p>
+  {% else %}
+  <p class="muted">Nothing to compare yet. Tickets count here once they have an AI judgement and their Jira state has been read.</p>
+  {% endif %}
+</section>
+
+{% set comparison_labels = {"differs": "Differs from AI", "rule": "Changed by a rule", "human": "Changed by a person", "agree": "Matches AI"} %}
+<form class="filters" method="get" action="/dashboard"
+      hx-get="/dashboard" hx-target="#records" hx-push-url="true" hx-trigger="change, submit">
+  <label>Status
+    <select name="status">
+      <option value="">All</option>
+      {% for v in options.statuses %}<option value="{{ v }}"{% if filters.status == v %} selected{% endif %}>{{ v | humanize }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>Category
+    <select name="type">
+      <option value="">All</option>
+      {% for v in options.types %}<option value="{{ v }}"{% if filters.type == v %} selected{% endif %}>{{ v | humanize }}</option>{% endfor %}
+    </select>
+  </label>
+  <label>AI urgency
+    <select name="urgency">
+      <option value="">All</option>
+      {% for v in options.urgencies %}<option value="{{ v }}"{% if filters.urgency == v %} selected{% endif %}>{{ v | humanize }}</option>{% endfor %}
+    </select>
+  </label>
+  {% if options.documents | length > 1 %}
+  <label>Sheet
+    <select name="document">
+      <option value="">All</option>
+      {% for id, name in options.documents %}<option value="{{ id }}"{% if filters.document_id == id %} selected{% endif %}>{{ name }}</option>{% endfor %}
+    </select>
+  </label>
+  {% endif %}
+  <label>AI vs. Jira
+    <select name="comparison">
+      <option value="">All</option>
+      {% for v in comparison_filters %}<option value="{{ v }}"{% if filters.comparison == v %} selected{% endif %}>{{ comparison_labels[v] }}</option>{% endfor %}
+    </select>
+  </label>
+  <noscript><button type="submit">Apply</button></noscript>
+</form>
+
+<section id="records" aria-live="polite">
+  {% include "_records.html" %}
+</section>
+{% endblock %}
