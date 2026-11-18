@@ -15,7 +15,7 @@
       <td class="request">
         <a href="/r/{{ r.system_id }}?{{ back_query }}">{{ r.title or "(no title)" }}</a>
         <div class="muted small">{{ r.document_name }} · {{ fmt_time(r.create_time) }}
-          {%- if r.attachment_count %} · <span class="clip" title="{{ r.attachment_count }} attachment{{ '' if r.attachment_count == 1 else 's' }}"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21.4 11.1l-8.5 8.5a5.5 5.5 0 0 1-7.8-7.8l8.5-8.5a3.7 3.7 0 0 1 5.2 5.2l-8.5 8.5a1.8 1.8 0 0 1-2.6-2.6l7.8-7.8"/></svg> {{ r.attachment_count }}</span>{% endif %}
+          {%- if r.attachment_count %} · <span class="clip" title="{{ r.attachment_count }} attachment{{ '' if r.attachment_count == 1 else 's' }}"><svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.4 11.1l-8.5 8.5a5.5 5.5 0 0 1-7.8-7.8l8.5-8.5a3.7 3.7 0 0 1 5.2 5.2l-8.5 8.5a1.8 1.8 0 0 1-2.6-2.6l7.8-7.8"/></svg> {{ r.attachment_count }}</span>{% endif %}
           {%- if r.source_deleted_at %} · <span class="badge warn">Row deleted</span>{% endif %}</div>
       </td>
       <td>{{ status_badge(r.status, r.status_terminal) }}</td>

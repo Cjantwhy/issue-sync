@@ -7,6 +7,7 @@
   out the reporter's contact details and asks search engines not to index it.
 """
 
+import hashlib
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -57,8 +58,28 @@ def _format_time(value: datetime | None, request: Request) -> str:
     return value.astimezone(zone).strftime("%Y-%m-%d %H:%M")
 
 
+def _asset_versions() -> dict[str, str]:
+    """Content hash per static file, read once at startup."""
+    return {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()[:10]
+        for path in STATIC_DIR.iterdir()
+        if path.is_file()
+    }
+
+
+ASSET_VERSIONS = _asset_versions()
+
+
+def asset(name: str) -> str:
+    """URL of a static file that changes whenever the file does, so browsers never
+    combine a new page with a cached old stylesheet or script."""
+    version = ASSET_VERSIONS.get(name)
+    return f"/static/{name}?v={version}" if version else f"/static/{name}"
+
+
 templates.env.filters["humanize"] = humanize
 templates.env.filters["safe_url"] = safe_url
+templates.env.globals["asset"] = asset
 
 
 def get_sessionmaker(request: Request) -> async_sessionmaker[AsyncSession]:

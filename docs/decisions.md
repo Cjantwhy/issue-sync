@@ -418,6 +418,10 @@ One entry per trade-off: context, what was chosen, and why not the alternative.
 - **Chosen:** README screenshots come from a separate, throwaway database filled with invented requests and people, served by a local api with the example configs. Real tickets and names never appear in the portfolio.
 - The attachment indicator became an inline SVG: the emoji rendered differently on each system (and not at all without an emoji font).
 
+### Static files are versioned by content
+- **Context:** The first README screenshot showed huge black shapes: the browser combined the new page (with the new SVG icon) with its cached old stylesheet, which had no rule for the icon, so the SVG filled the cell in black. Any user returning after an upgrade could have seen the same.
+- **Chosen:** Pages link static files as `/static/app.css?v=<content hash>`, computed once at startup, so a changed file always has a new URL. The icon also carries its size and paint as SVG attributes, so it renders correctly even without the stylesheet.
+
 ### Verified live through the production stack
 - With `docker-compose.prod.yml` and the tunnel in Compose: Jira webhooks reach the app (an unsigned request gets the app's 401), detail pages and static files load from outside, and `/dashboard` and `/health` answer 404 at Cloudflare.
 - Apps Script: a title typed by hand reached the app through the tunnel and got "Waiting for: Description" within a second; after the description was filled in, the scheduled re-check ran exactly 120 s later and created the ticket, with one job despite several edits. A Google Form submission (`source: form`, row 2) created its ticket and Slack message within 10 seconds.

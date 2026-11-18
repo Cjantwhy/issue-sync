@@ -6,8 +6,8 @@
   <meta name="robots" content="noindex, nofollow">
   {% block meta %}{% endblock %}
   <title>{% block title %}issue-sync{% endblock %}</title>
-  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/app.css">
+  <link rel="icon" href="{{ asset('favicon.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ asset('app.css') }}">
   {% block head %}{% endblock %}
 </head>
 <body>

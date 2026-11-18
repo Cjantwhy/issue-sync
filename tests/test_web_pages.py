@@ -578,6 +578,18 @@ async def test_unknown_or_malformed_id_is_the_same_404(
     assert "Request not found" in response.text
 
 
+async def test_pages_link_versioned_assets(
+    client: httpx.AsyncClient, seeded: dict[str, DocumentRecord]
+) -> None:
+    html = (await client.get("/dashboard", headers=_auth())).text
+    css = routes.ASSET_VERSIONS["app.css"]
+    assert f'href="/static/app.css?v={css}"' in html
+    assert f'src="/static/htmx-2.0.4.min.js?v={routes.ASSET_VERSIONS["htmx-2.0.4.min.js"]}"' in html
+    assert (await client.get(f"/static/app.css?v={css}")).status_code == 200
+    # The paperclip carries its own size and paint, so it never depends on the CSS.
+    assert 'width="14" height="14" viewBox="0 0 24 24" fill="none"' in html
+
+
 async def test_static_files_are_served(client: httpx.AsyncClient) -> None:
     assert (await client.get("/static/htmx-2.0.4.min.js")).status_code == 200
     assert (await client.get("/static/app.css")).status_code == 200

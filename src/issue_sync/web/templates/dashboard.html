@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block meta %}<meta name="htmx-config" content='{"includeIndicatorStyles": false}'>{% endblock %}
 {% block title %}Dashboard · issue-sync{% endblock %}
-{% block head %}<script src="/static/htmx-2.0.4.min.js" defer></script>{% endblock %}
+{% block head %}<script src="{{ asset('htmx-2.0.4.min.js') }}" defer></script>{% endblock %}
 {% block nav %}<span class="muted">Dashboard</span>{% endblock %}
 {% block main_class %}wide{% endblock %}
 {% block content %}
