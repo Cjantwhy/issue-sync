@@ -18,6 +18,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 from sqlalchemy import select, update
@@ -40,6 +41,7 @@ from issue_sync.sources.sheets.layout import (
     SheetLayout,
     SheetRow,
     content_hash,
+    links_in_raw,
     parse_sheet,
 )
 from issue_sync.sync.settle import NewRowPolicy, waiting_note
@@ -94,6 +96,32 @@ def latest_note(text: str | None, author: str, created: datetime) -> str:
     body = " ".join((text or "").split())
     note = f"{created.astimezone(UTC):%Y-%m-%d} {author}: {body}"
     return note if len(note) <= NOTE_MAX_LENGTH else note[: NOTE_MAX_LENGTH - 1] + "…"
+
+
+def link_label(url: str) -> str:
+    """Display name for a link: the sheet gives no file names, and reading them from
+    Google Drive would need access to files the service account usually cannot see."""
+    parts = urlsplit(url)
+    host = parts.netloc.lower().removeprefix("www.")
+    if host in ("drive.google.com", "docs.google.com"):
+        return "Google Drive file"
+    return host or url
+
+
+def sheet_attachments(links: tuple[str, ...]) -> list[dict[str, str]] | None:
+    """History `attachments` value for links from the sheet."""
+    if not links:
+        return None
+    return [{"name": link_label(url), "url": url, "source": "sheet"} for url in links]
+
+
+async def record_links(session: AsyncSession, record: DocumentRecord) -> tuple[str, ...]:
+    """The record's current attachment links, from its stored row."""
+    mapping = await session.scalar(
+        select(Document.mapping).where(Document.id == record.document_id)
+    )
+    header = (mapping or {}).get("attachments")
+    return links_in_raw(record.raw, header if isinstance(header, str) else None)
 
 
 def record_values(row: SheetRow) -> dict[str, str | None]:
@@ -217,7 +245,7 @@ class InboundSync:
                 written[system_id] = self._system_cells(system_id)
 
         for system_id, row in identified.items():
-            await self._upsert(document, system_id, row, report)
+            await self._upsert(document, mapping, system_id, row, report)
 
         fixed, count = await self._fix_system_cells(document, layout, identified, written)
         report.cells_written += count
@@ -421,7 +449,12 @@ class InboundSync:
     # ---------- records ----------
 
     async def _upsert(
-        self, document: Document, system_id: uuid.UUID, row: SheetRow, report: SyncReport
+        self,
+        document: Document,
+        mapping: DocumentMapping,
+        system_id: uuid.UUID,
+        row: SheetRow,
+        report: SyncReport,
     ) -> None:
         values = record_values(row)
         async with self._sessionmaker() as session, session.begin():
@@ -447,6 +480,7 @@ class InboundSync:
                                 event_type="created",
                                 created_by=CREATED_BY_SHEET,
                                 detail={"row": row.row_number},
+                                attachments=sheet_attachments(row.links),
                             ),
                             TicketSync(document_record_id=record_id),
                         ]
@@ -476,6 +510,9 @@ class InboundSync:
                 for name, value in values.items()
                 if getattr(record, name) != value
             }
+            old_links = links_in_raw(record.raw, mapping.attachments)
+            if old_links != row.links:
+                changes["attachments"] = {"from": list(old_links), "to": list(row.links)}
             record.raw = row.raw
             record.raw_hash = row.raw_hash
             for name, value in values.items():
@@ -489,6 +526,9 @@ class InboundSync:
                     event_type="source_modified",
                     created_by=CREATED_BY_SHEET,
                     detail={"row": row.row_number, "changes": changes},
+                    attachments=(
+                        sheet_attachments(row.links) if "attachments" in changes else None
+                    ),
                 )
             )
             await session.execute(

@@ -11,6 +11,7 @@ import time
 import uuid
 from datetime import datetime
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -31,7 +32,7 @@ from issue_sync.tickets.base import (
 from issue_sync.tickets.jira import adf
 from issue_sync.tickets.jira.auth import OAuthClientCredentials, gateway_url
 from issue_sync.tickets.jira.client import JiraClient
-from issue_sync.tickets.jira.webhook import parse_jira_webhook
+from issue_sync.tickets.jira.webhook import parse_attachments, parse_jira_webhook
 
 # Every ticket is labelled with its record's system_id so a create that timed out (but
 # succeeded in Jira) can be found again instead of creating a duplicate.
@@ -42,6 +43,7 @@ SNAPSHOT_FIELDS = "status,priority,assignee,updated"
 REPORT_BATCH_SIZE = 100
 REPORT_FIELDS = [
     "status", "priority", "assignee", "updated", "summary", "description", "labels", "comment",
+    "attachment",
 ]  # fmt: skip
 # An unknown status id reloads the project's statuses at most this often.
 STATUS_RELOAD_SECONDS = 60.0
@@ -95,8 +97,17 @@ def build_description(content: TicketContent) -> adf.Node:
         ]
     )
 
+    links = [link for link in content.links if adf.clean_text(link).strip()]
+    attachments: list[adf.Node] = []
+    if links:
+        attachments = [
+            adf.paragraph(adf.text("Attachments from the sheet", strong=True)),
+            adf.bullet_list(*([adf.text(link, href=link)] for link in links)),
+        ]
+
     return adf.doc(
         *body,
+        *attachments,
         adf.rule(),
         *build_triage_section(content.triage),
         adf.bullet_list(*details),
@@ -162,7 +173,13 @@ class JiraBackend:
         await self._client.aclose()
 
     async def parse_webhook(self, payload: dict[str, Any]) -> TicketEvent | None:
-        return await parse_jira_webhook(payload, self._config, self._resolve_status)
+        return await parse_jira_webhook(
+            payload, self._config, self._resolve_status, self.attachment_url
+        )
+
+    def attachment_url(self, attachment_id: str, filename: str) -> str:
+        """Opens the file in a browser signed in to Jira (the API content URL needs a token)."""
+        return f"{self._client.base_url}/secure/attachment/{quote(attachment_id)}/{quote(filename)}"
 
     async def _resolve_status(self, status: dict[str, Any]) -> tuple[str | None, str]:
         """Map a webhook status by id, not by name.
@@ -299,6 +316,7 @@ class JiraBackend:
                 )
                 for c in raw_comments
             ],
+            attachments=parse_attachments(fields.get("attachment"), self.attachment_url),
         )
 
     def content_matches(self, content: TicketContent, ticket: TicketReport) -> bool:

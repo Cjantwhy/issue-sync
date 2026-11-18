@@ -7,7 +7,12 @@ from issue_sync.cli import CliError, build_mapping, spreadsheet_id_from
 from issue_sync.settings import _valid_poll_interval
 from issue_sync.sources.sheets.client import column_letter, quote_sheet
 from issue_sync.sources.sheets.errors import SheetLayoutError
-from issue_sync.sources.sheets.layout import DocumentMapping, parse_sheet
+from issue_sync.sources.sheets.layout import (
+    DocumentMapping,
+    links_in_raw,
+    parse_links,
+    parse_sheet,
+)
 from issue_sync.sync.retry import backoff_seconds, poll_schedule, retry_delay
 
 MAPPING = DocumentMapping(
@@ -194,3 +199,43 @@ def test_valid_poll_intervals(seconds: int) -> None:
 def test_invalid_poll_intervals(seconds: int) -> None:
     with pytest.raises(ValueError):
         _valid_poll_interval(seconds)
+
+
+# ---------- attachment links ----------
+
+
+@pytest.mark.parametrize(
+    ("cell", "expected"),
+    [
+        (
+            "https://drive.google.com/open?id=A, https://drive.google.com/open?id=B",
+            ("https://drive.google.com/open?id=A", "https://drive.google.com/open?id=B"),
+        ),
+        (
+            "see https://x.example.com/a.pdf\nand http://y.example.com/b",
+            (
+                "https://x.example.com/a.pdf",
+                "http://y.example.com/b",
+            ),
+        ),
+        ("https://a.example.com/x https://a.example.com/x", ("https://a.example.com/x",)),
+        ("javascript:alert(1) ftp://files.example.com/a file.pdf https://", ()),
+        ("", ()),
+        (None, ()),
+    ],
+)
+def test_parse_links(cell: str | None, expected: tuple[str, ...]) -> None:
+    assert parse_links(cell) == expected
+
+
+def test_parse_links_limits() -> None:
+    many = " ".join(f"https://example.com/{i}" for i in range(50))
+    assert len(parse_links(many)) == 20
+    assert parse_links("https://example.com/" + "x" * 3000) == ()
+
+
+def test_links_in_raw() -> None:
+    raw = {"Files": "https://example.com/a", "Title": "x"}
+    assert links_in_raw(raw, "Files") == ("https://example.com/a",)
+    assert links_in_raw(raw, None) == ()
+    assert links_in_raw(None, "Files") == ()

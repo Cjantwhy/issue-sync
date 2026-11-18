@@ -30,7 +30,7 @@ from issue_sync.db.models import (
 )
 from issue_sync.rules import Assignment, RequestFacts, decide
 from issue_sync.sources.sheets.layout import content_hash
-from issue_sync.sync.inbound import detail_url
+from issue_sync.sync.inbound import detail_url, record_links
 from issue_sync.sync.ticket_events import apply_snapshot
 from issue_sync.tickets.base import (
     TicketBackend,
@@ -69,9 +69,13 @@ class PushResult:
 
 
 def ticket_content(
-    record: DocumentRecord, public_base_url: str, triage: TriageNote | None = None
+    record: DocumentRecord,
+    public_base_url: str,
+    triage: TriageNote | None = None,
+    links: tuple[str, ...] = (),
 ) -> TicketContent:
     return TicketContent(
+        links=links,
         title=record.title,
         description=record.description,
         reporter=record.reporter,
@@ -112,7 +116,7 @@ async def push_record(
                     exc,
                 )
 
-        content = ticket_content(record, public_base_url, note)
+        content = ticket_content(record, public_base_url, note, await record_links(session, record))
         pushed_hash = content_hash(content.model_dump(mode="json"))
         if sync.issue_key and sync.pushed_hash == pushed_hash:
             # e.g. an edit that was reverted before the push ran

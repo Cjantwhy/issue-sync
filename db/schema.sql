@@ -88,11 +88,11 @@ CREATE TABLE document_record_history (
     document_record_id  BIGINT NOT NULL REFERENCES document_record (id),
     event_type          VARCHAR(32) NOT NULL
         CHECK (event_type IN ('created', 'status_changed', 'source_modified',
-                              'comment', 'source_deleted')),
+                              'comment', 'attachment', 'source_deleted')),
     from_status_id      INTEGER REFERENCES document_record_status (id),
     to_status_id        INTEGER REFERENCES document_record_status (id),
     comment             TEXT,
-    attachments         JSONB,                          -- [{"name": "...", "url": "..."}]
+    attachments         JSONB,                          -- [{"name": "...", "url": "...", "source": "sheet" | "jira"}]
     detail              JSONB,                          -- e.g. before/after values of an external change
     created_by          VARCHAR(255) NOT NULL,
     create_time         TIMESTAMPTZ NOT NULL DEFAULT now()

@@ -39,6 +39,8 @@ class TicketContent(_Model):
     detail_url: str
     # None: the record has no AI judgement (classification failed, or it predates AI triage).
     triage: TriageNote | None = None
+    # Links from the sheet's attachments column (e.g. Google Drive files), in order.
+    links: tuple[str, ...] = ()
 
 
 class TicketDraft(TicketContent):
@@ -86,6 +88,19 @@ class TicketComment(_Model):
     created_at: datetime
 
 
+class TicketAttachment(_Model):
+    """A file added to the ticket. `url` opens it for people signed in to the ticket system."""
+
+    id: str
+    filename: str
+    url: str
+    author_id: str | None
+    author_name: str | None
+    created_at: datetime
+    size: int | None = None
+    mime_type: str | None = None
+
+
 class TicketReport(TicketSnapshot):
     """Everything reconciliation compares: state, owned content and comments."""
 
@@ -93,6 +108,7 @@ class TicketReport(TicketSnapshot):
     summary: str
     description_text: str  # the description as plain text
     comments: list[TicketComment]
+    attachments: list[TicketAttachment] = []
 
 
 class TicketEvent(_Model):
@@ -109,6 +125,9 @@ class TicketEvent(_Model):
     # applied out of order still converge on the newest state.
     state: TicketState | None = None
     comment: TicketComment | None = None
+    # issue_updated: the ticket's attachments as the event reports them. Logged once
+    # each (by id), whether or not the event is stale.
+    attachments: list[TicketAttachment] = []
 
 
 # ---------- Errors ----------

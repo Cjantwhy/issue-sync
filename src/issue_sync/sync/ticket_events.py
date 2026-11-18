@@ -22,7 +22,13 @@ from issue_sync.db.models import (
     DocumentRecordStatus,
     TicketSync,
 )
-from issue_sync.tickets.base import TicketComment, TicketEvent, TicketSnapshot, TicketState
+from issue_sync.tickets.base import (
+    TicketAttachment,
+    TicketComment,
+    TicketEvent,
+    TicketSnapshot,
+    TicketState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,14 +64,21 @@ async def apply_ticket_event(
         if event.comment is not None:
             return await _add_comment(session, record, event)
         assert event.state is not None
+        # Attachments are keyed by id, not ordered by time: even a stale event may name
+        # one that was missed, and a repeated one is skipped.
+        added = await add_attachments(session, record, event.attachments, service_account_id=None)
         if sync.ticket_updated_at is not None and event.occurred_at <= sync.ticket_updated_at:
-            return ApplyResult("stale", record.document_id)
+            return ApplyResult("updated" if added else "stale", record.document_id)
         sync.ticket_updated_at = event.occurred_at
         before = (record.current_priority, record.current_assignee)
         status_changed = await apply_state(
             session, record, event.state, actor=event.actor_name or event.actor_id
         )
-        changed = status_changed or before != (record.current_priority, record.current_assignee)
+        changed = (
+            status_changed
+            or added > 0
+            or before != (record.current_priority, record.current_assignee)
+        )
         return ApplyResult(
             "updated" if changed else "unchanged",
             record.document_id,
@@ -142,6 +155,58 @@ async def _add_comment(
     if not await add_comment(session, record, event.comment):
         return ApplyResult("duplicate", record.document_id)
     return ApplyResult("updated", record.document_id, sheet_changed=True)
+
+
+async def recorded_attachment_ids(session: AsyncSession, record_id: int) -> set[str]:
+    rows = await session.scalars(
+        select(DocumentRecordHistory.detail["jira_attachment_id"].astext).where(
+            DocumentRecordHistory.document_record_id == record_id,
+            DocumentRecordHistory.event_type == "attachment",
+        )
+    )
+    return {r for r in rows if r}
+
+
+async def add_attachments(
+    session: AsyncSession,
+    record: DocumentRecord,
+    attachments: list[TicketAttachment],
+    *,
+    service_account_id: str | None,
+) -> int:
+    """Log each ticket attachment once (keyed by its Jira id). Returns how many were new.
+
+    Files added by `service_account_id` are skipped: this system does not upload files
+    today, and if it ever does, they must not echo back as events.
+    """
+    if not attachments:
+        return 0
+    known = await recorded_attachment_ids(session, record.id)
+    added = 0
+    for item in sorted(attachments, key=lambda a: a.created_at):
+        if item.id in known or (service_account_id and item.author_id == service_account_id):
+            continue
+        known.add(item.id)
+        session.add(
+            DocumentRecordHistory(
+                document_record_id=record.id,
+                event_type="attachment",
+                attachments=[
+                    {
+                        "name": item.filename,
+                        "url": item.url,
+                        "source": "jira",
+                        "size": item.size,
+                        "mime_type": item.mime_type,
+                    }
+                ],
+                created_by=item.author_name or item.author_id or "jira",
+                detail={"jira_attachment_id": item.id},
+                create_time=item.created_at,  # when it was added in Jira
+            )
+        )
+        added += 1
+    return added
 
 
 async def recorded_comment_ids(session: AsyncSession, record_id: int) -> set[str]:

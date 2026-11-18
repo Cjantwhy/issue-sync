@@ -24,9 +24,10 @@ from issue_sync.db.models import Document, DocumentRecord, DocumentRecordHistory
 from issue_sync.notify.alerts import Alert
 from issue_sync.sources.sheets.errors import SheetLayoutError, SheetsError
 from issue_sync.sources.sheets.layout import DocumentMapping, parse_sheet
-from issue_sync.sync.inbound import SheetsSource
+from issue_sync.sync.inbound import SheetsSource, record_links
 from issue_sync.sync.push import latest_triage, ticket_content
 from issue_sync.sync.ticket_events import (
+    add_attachments,
     add_comment,
     apply_snapshot,
     apply_state,
@@ -49,6 +50,7 @@ class ReconcileReport:
     tickets_checked: int = 0
     tickets_updated: int = 0
     comments_added: int = 0
+    attachments_added: int = 0
     content_restored: int = 0
     rows_deleted: int = 0
     rows_restored: int = 0
@@ -62,6 +64,7 @@ class ReconcileReport:
             "tickets_checked": self.tickets_checked,
             "tickets_updated": self.tickets_updated,
             "comments_added": self.comments_added,
+            "attachments_added": self.attachments_added,
             "content_restored": self.content_restored,
             "rows_deleted": self.rows_deleted,
             "rows_restored": self.rows_restored,
@@ -183,10 +186,16 @@ class Reconciler:
                 if await add_comment(session, record, comment, known):
                     report.comments_added += 1
                     sheet_changed = True
+            report.attachments_added += await add_attachments(
+                session, record, ticket.attachments, service_account_id=self._service_account_id
+            )
 
             if sync.push_status == "success":
                 content = ticket_content(
-                    record, self._public_base_url, await latest_triage(session, record.id)
+                    record,
+                    self._public_base_url,
+                    await latest_triage(session, record.id),
+                    await record_links(session, record),
                 )
                 if not self._backend.content_matches(content, ticket):
                     logger.warning(

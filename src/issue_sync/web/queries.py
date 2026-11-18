@@ -27,9 +27,12 @@ from issue_sync.db.models import (
     DocumentRecordStatus,
     TicketSync,
 )
+from issue_sync.sources.sheets.layout import links_in_raw
+from issue_sync.sync.inbound import sheet_attachments
 from issue_sync.web.comparison import DIFFERS, translate, verdict
 
 PAGE_SIZE = 50
+SEARCH_MAX_LENGTH = 200
 
 # Comparison filter values: "differs" means rule or human.
 COMPARISON_FILTERS = ("differs", "rule", "human", "agree")
@@ -42,11 +45,15 @@ class Filters:
     urgency: str | None = None
     document_id: int | None = None
     comparison: str | None = None
+    search: str | None = None  # part of the title, case-insensitive
+    attention: bool = False  # push failed, or the row was deleted from the sheet
     page: int = 1
 
     def query(self, **overrides: Any) -> dict[str, str]:
         """Non-empty values as query parameters (for links and the pushed URL)."""
         values = {
+            "q": self.search,
+            "attention": "1" if self.attention else None,
             "status": self.status,
             "type": self.type,
             "urgency": self.urgency,
@@ -81,6 +88,22 @@ class RecordRow:
     assignment_rule: str | None
     priority_verdict: str
     assignee_verdict: str
+    jira_attachments: int = 0
+    sheet_links: tuple[str, ...] = ()
+
+    @property
+    def attachment_count(self) -> int:
+        return self.jira_attachments + len(self.sheet_links)
+
+
+def _row(values: dict[str, Any]) -> RecordRow:
+    """A RecordRow from a select_rows() result: links come from the stored sheet row."""
+    raw = values.pop("raw")
+    mapping = values.pop("mapping") or {}
+    header = mapping.get("attachments")
+    return RecordRow(
+        **values, sheet_links=links_in_raw(raw, header if isinstance(header, str) else None)
+    )
 
 
 @dataclass(frozen=True)
@@ -129,6 +152,22 @@ class RecordDetail:
     reporter: str | None
     judgements: list[Judgement]  # newest first
     timeline: list[TimelineEvent] = field(default_factory=list)
+
+    @property
+    def sheet_attachments(self) -> list[dict[str, Any]]:
+        """The links the sheet row has now."""
+        return sheet_attachments(self.row.sheet_links) or []
+
+    @property
+    def jira_attachments(self) -> list[dict[str, Any]]:
+        """Every file added to the ticket, oldest first, with who added it and when."""
+        return [
+            {**item, "added_by": e.created_by, "added_at": e.create_time}
+            for e in self.timeline
+            if e.event_type == "attachment"
+            for item in e.attachments
+            if isinstance(item, dict)
+        ]
 
 
 @dataclass(frozen=True)
@@ -211,6 +250,15 @@ class _Columns:
                 TicketSync.assignment_rule,
                 self.priority_verdict,
                 self.assignee_verdict,
+                select(func.count())
+                .where(
+                    DocumentRecordHistory.document_record_id == DocumentRecord.id,
+                    DocumentRecordHistory.event_type == "attachment",
+                )
+                .scalar_subquery()
+                .label("jira_attachments"),
+                DocumentRecord.raw,
+                Document.mapping,
             )
             .select_from(DocumentRecord)
             .join(Document, Document.id == DocumentRecord.document_id)
@@ -227,6 +275,15 @@ class _Columns:
         )
 
     def apply(self, query: Select[Any], filters: Filters) -> Select[Any]:
+        if filters.search:
+            query = query.where(DocumentRecord.title.icontains(filters.search, autoescape=True))
+        if filters.attention:
+            query = query.where(
+                or_(
+                    TicketSync.push_status == "failed",
+                    DocumentRecord.source_deleted_at.is_not(None),
+                )
+            )
         if filters.status:
             query = query.where(DocumentRecordStatus.status_name == filters.status)
         if filters.type:
@@ -262,7 +319,7 @@ async def list_records(session: AsyncSession, jira: JiraConfig, filters: Filters
         .limit(PAGE_SIZE)
         .offset((page - 1) * PAGE_SIZE)
     )
-    rows = [RecordRow(**row._asdict()) for row in result]
+    rows = [_row(row._asdict()) for row in result]
     return RecordPage(rows=rows, total=total, page=page, pages=pages)
 
 
@@ -380,7 +437,7 @@ async def record_detail(
         .order_by(DocumentRecordHistory.create_time, DocumentRecordHistory.id)
     )
     return RecordDetail(
-        row=RecordRow(**values),
+        row=_row(values),
         description=description,
         reporter=reporter,
         judgements=[Judgement(*j) for j in judgements],

@@ -42,7 +42,14 @@ NAMING_CONVENTION = {
 }
 
 PUSH_STATUSES = ("pending", "success", "failed")
-HISTORY_EVENT_TYPES = ("created", "status_changed", "source_modified", "comment", "source_deleted")
+HISTORY_EVENT_TYPES = (
+    "created",
+    "status_changed",
+    "source_modified",
+    "comment",
+    "attachment",
+    "source_deleted",
+)
 
 
 class Base(DeclarativeBase):
@@ -200,7 +207,7 @@ class DocumentRecordHistory(Base):
     __table_args__ = (
         CheckConstraint(
             "event_type IN ('created', 'status_changed', 'source_modified', "
-            "'comment', 'source_deleted')",
+            "'comment', 'attachment', 'source_deleted')",
             name="event_type",
         ),
         Index("idx_history_record_time", "document_record_id", "create_time"),
@@ -218,7 +225,7 @@ class DocumentRecordHistory(Base):
         Integer, ForeignKey("document_record_status.id")
     )
     comment: Mapped[str | None] = mapped_column(Text)
-    # [{"name": "...", "url": "..."}]
+    # [{"name": "...", "url": "...", "source": "sheet" | "jira", ...}]
     attachments: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
     detail: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_by: Mapped[str] = mapped_column(String(255), nullable=False)

@@ -17,7 +17,8 @@ from issue_sync.tickets.base import (
     TicketRequestRejected,
     TransitionNotAvailable,
 )
-from issue_sync.tickets.jira.backend import JiraBackend
+from issue_sync.tickets.jira import adf
+from issue_sync.tickets.jira.backend import JiraBackend, build_description
 from tests.jira_fixtures import EMAIL, SITE, TOKEN
 
 SYSTEM_ID = uuid.UUID("0b8f9a52-6c1e-4d5a-9a43-2f1d8e7c6b5a")
@@ -336,3 +337,84 @@ async def test_token_never_appears_in_errors(
     with pytest.raises(TicketAuthError) as exc_info:
         await backend.get_ticket("OPS-7")
     assert TOKEN not in str(exc_info.value)
+
+
+# ---------- attachments and sheet links ----------
+
+
+def _description_text(content: TicketContent) -> str:
+    return adf.to_plain_text(build_description(content))
+
+
+def test_sheet_links_are_listed_in_the_description() -> None:
+    links = ("https://drive.google.com/open?id=abc", "https://files.example.com/a.pdf")
+    content = TicketContent.model_validate(_draft(links=links).model_dump())
+
+    doc = build_description(content)
+    text = _description_text(content)
+    assert "Attachments from the sheet" in text
+    assert all(link in text for link in links)
+    hrefs = [
+        mark["attrs"]["href"]
+        for node in _walk(doc)
+        for mark in node.get("marks", [])
+        if mark.get("type") == "link"
+    ]
+    assert set(links) <= set(hrefs)
+    # Without links, the description has no such section.
+    assert "Attachments from the sheet" not in _description_text(
+        TicketContent.model_validate(_draft().model_dump())
+    )
+
+
+def _walk(node: object) -> list[dict]:
+    found: list[dict] = []
+    if isinstance(node, dict):
+        found.append(node)
+        for child in node.get("content", []):
+            found += _walk(child)
+    return found
+
+
+async def test_reports_include_attachments(
+    backend: JiraBackend, jira_mock: respx.MockRouter
+) -> None:
+    route = jira_mock.post("/search/jql").respond(
+        200,
+        json={
+            "isLast": True,
+            "issues": [
+                {
+                    "key": "OPS-7",
+                    "fields": {
+                        "labels": [f"issue-sync-{SYSTEM_ID}"],
+                        "status": {"name": "In Progress"},
+                        "priority": {"name": "High"},
+                        "assignee": None,
+                        "updated": "2026-11-17T09:30:00.000+0800",
+                        "summary": "Export fails",
+                        "description": None,
+                        "comment": {"comments": [], "total": 0},
+                        "attachment": [
+                            {
+                                "id": "10200",
+                                "filename": "log.txt",
+                                "author": {"accountId": "acc-1", "displayName": "Olga Ops"},
+                                "created": "2026-11-17T10:05:00.000+0800",
+                                "size": 10,
+                                "mimeType": "text/plain",
+                            }
+                        ],
+                    },
+                }
+            ],
+        },
+    )
+
+    [report] = await backend.find_tickets([SYSTEM_ID])
+
+    assert "attachment" in _body(route)["fields"]
+    assert [(a.id, a.filename, a.author_name) for a in report.attachments] == [
+        ("10200", "log.txt", "Olga Ops")
+    ]
+    assert report.attachments[0].url == f"{SITE}/secure/attachment/10200/log.txt"

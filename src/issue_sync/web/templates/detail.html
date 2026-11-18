@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% from "_macros.html" import status_badge, verdict_badge %}
 {% block title %}{{ r.title or "Request" }} · issue-sync{% endblock %}
+{% block nav %}{% if back_url %}<a class="back" href="{{ back_url }}">← Back to dashboard</a>{% endif %}{% endblock %}
 {% block content %}
 <article class="detail">
   <header class="detail-head">
@@ -17,6 +18,40 @@
     <h2>Request</h2>
     {% if d.description %}<div class="text">{{ d.description }}</div>{% else %}<p class="muted">No description.</p>{% endif %}
   </section>
+
+  {% set sheet_files = d.sheet_attachments %}
+  {% set jira_files = d.jira_attachments %}
+  {% if sheet_files or jira_files %}
+  <section>
+    <h2>Attachments</h2>
+    <div class="attachment-groups">
+      {% if sheet_files %}
+      <div>
+        <h3>From the sheet</h3>
+        <ul class="files">
+          {% for a in sheet_files %}
+            {% set url = a.url | safe_url %}
+            <li>{% if url %}<a href="{{ url }}" rel="noreferrer noopener" target="_blank">{{ a.name }}</a>{% else %}{{ a.name }}{% endif %}</li>
+          {% endfor %}
+        </ul>
+      </div>
+      {% endif %}
+      {% if jira_files %}
+      <div>
+        <h3>Added in Jira</h3>
+        <ul class="files">
+          {% for a in jira_files %}
+            {% set url = a.url | safe_url %}
+            <li>{% if url %}<a href="{{ url }}" rel="noreferrer noopener" target="_blank">{{ a.name }}</a>{% else %}{{ a.name }}{% endif %}
+              <span class="muted small">{% if a.size %}{{ a.size | filesizeformat }} · {% endif %}{{ a.added_by }} · {{ fmt_time(a.added_at) }}</span></li>
+          {% endfor %}
+        </ul>
+        <p class="hint">Files added in Jira open for people signed in to Jira.</p>
+      </div>
+      {% endif %}
+    </div>
+  </section>
+  {% endif %}
 
   <section>
     <h2>Triage</h2>
@@ -81,6 +116,8 @@
           {% elif e.event_type == "status_changed" %}
             Status {% if e.from_status %}{{ e.from_status | humanize }} → {% endif %}<strong>{{ e.to_status | humanize }}</strong>
             <span class="muted">by {{ e.created_by }}</span>
+          {% elif e.event_type == "attachment" %}
+            File added in Jira <span class="muted">by {{ e.created_by }}</span>
           {% elif e.event_type == "comment" %}
             Comment <span class="muted">by {{ e.created_by }}</span>
             {% if e.comment %}<div class="text">{{ e.comment }}</div>{% endif %}
@@ -92,8 +129,14 @@
               {% set changes = e.detail.changes if e.detail.changes is mapping else {} %}
               <ul class="changes">
               {% for name in public_change_fields if name in changes %}
+                {% set before, after = changes[name].from, changes[name].to %}
+                {% if name == "attachments" %}
+                <li><span class="k">Attachments</span>
+                  {{ before | length }} link{{ "" if before | length == 1 else "s" }} → {{ after | length }} link{{ "" if after | length == 1 else "s" }}</li>
+                {% else %}
                 <li><span class="k">{{ name | humanize }}</span>
-                  <del>{{ changes[name].from or "(empty)" }}</del> → <ins>{{ changes[name].to or "(empty)" }}</ins></li>
+                  <del>{{ before or "(empty)" }}</del> → <ins>{{ after or "(empty)" }}</ins></li>
+                {% endif %}
               {% endfor %}
               </ul>
             {% endif %}
@@ -106,7 +149,8 @@
           <ul class="attachments">
             {% for a in e.attachments %}
               {% set url = a.url | safe_url %}
-              <li>{% if url %}<a href="{{ url }}" rel="noreferrer noopener" target="_blank">{{ a.name or url }}</a>{% else %}{{ a.name }}{% endif %}</li>
+              <li>{% if url %}<a href="{{ url }}" rel="noreferrer noopener" target="_blank">{{ a.name or url }}</a>{% else %}{{ a.name }}{% endif %}
+                {%- if a.size %} <span class="muted small">{{ a.size | filesizeformat }}</span>{% endif %}</li>
             {% endfor %}
           </ul>
           {% endif %}

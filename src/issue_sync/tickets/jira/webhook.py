@@ -13,10 +13,18 @@ from datetime import UTC, datetime
 from typing import Any
 
 from issue_sync.adapter_config import JiraConfig
-from issue_sync.tickets.base import TicketComment, TicketEvent, TicketState
+from issue_sync.tickets.base import (
+    TicketAttachment,
+    TicketComment,
+    TicketEvent,
+    TicketState,
+)
 from issue_sync.tickets.jira import adf
 
 SIGNATURE_HEADER = "X-Hub-Signature"
+# (attachment id, filename) -> link that opens the file for signed-in people
+AttachmentUrl = Callable[[str, str], str]
+FILENAME_MAX_LENGTH = 255
 SUPPORTED_EVENTS = {"jira:issue_updated": "issue_updated", "comment_created": "comment_created"}
 COMMENT_MAX_LENGTH = 10_000
 _ISSUE_KEY = re.compile(r"^[A-Z][A-Z0-9_]+-[1-9][0-9]*$")
@@ -44,9 +52,35 @@ def slim_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "key": issue.get("key"),
             "fields": {
                 name: fields.get(name) for name in ("project", "status", "priority", "assignee")
-            },
+            }
+            | {"attachment": [_slim_attachment(a) for a in _as_list(fields.get("attachment"))]},
+        },
+        "changelog": {
+            "items": [
+                item
+                for item in _as_list((payload.get("changelog") or {}).get("items"))
+                if isinstance(item, dict) and item.get("field") == "Attachment"
+            ]
         },
         "comment": payload.get("comment"),
+    }
+
+
+def _as_list(value: object) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _slim_attachment(attachment: object) -> dict[str, Any]:
+    if not isinstance(attachment, dict):
+        return {}
+    author = attachment.get("author") or {}
+    return {
+        "id": attachment.get("id"),
+        "filename": attachment.get("filename"),
+        "created": attachment.get("created"),
+        "size": attachment.get("size"),
+        "mimeType": attachment.get("mimeType"),
+        "author": {"accountId": author.get("accountId"), "displayName": author.get("displayName")},
     }
 
 
@@ -57,7 +91,10 @@ def actor_id(payload: dict[str, Any]) -> str | None:
 
 
 async def parse_jira_webhook(
-    payload: dict[str, Any], config: JiraConfig, resolve_status: StatusResolver
+    payload: dict[str, Any],
+    config: JiraConfig,
+    resolve_status: StatusResolver,
+    attachment_url: AttachmentUrl,
 ) -> TicketEvent | None:
     kind = SUPPORTED_EVENTS.get(str(payload.get("webhookEvent")))
     issue = payload.get("issue") or {}
@@ -96,6 +133,9 @@ async def parse_jira_webhook(
             assignee_id=assignee.get("accountId"),
             assignee_name=assignee.get("displayName"),
         )
+        event["attachments"] = parse_attachments(
+            fields.get("attachment"), attachment_url
+        ) or _attachments_from_changelog(payload, event, attachment_url)
     else:
         if not comment_data.get("id"):
             return None
@@ -110,6 +150,55 @@ async def parse_jira_webhook(
             created_at=_parse_time(comment_data.get("created")) or event["occurred_at"],
         )
     return TicketEvent.model_validate(event)
+
+
+def parse_attachments(value: object, attachment_url: AttachmentUrl) -> list[TicketAttachment]:
+    """The issue's `attachment` field (REST API or webhook issue representation)."""
+    found = []
+    for item in _as_list(value):
+        if not isinstance(item, dict) or not item.get("id") or not item.get("filename"):
+            continue
+        author = item.get("author") or {}
+        attachment_id, filename = str(item["id"]), str(item["filename"])
+        size = item.get("size")
+        found.append(
+            TicketAttachment(
+                id=attachment_id,
+                filename=filename[:FILENAME_MAX_LENGTH],
+                url=attachment_url(attachment_id, filename),
+                author_id=author.get("accountId"),
+                author_name=author.get("displayName"),
+                created_at=_parse_time(item.get("created")) or datetime.now(UTC),
+                size=size if isinstance(size, int) else None,
+                mime_type=item.get("mimeType"),
+            )
+        )
+    return found
+
+
+def _attachments_from_changelog(
+    payload: dict[str, Any], event: dict[str, Any], attachment_url: AttachmentUrl
+) -> list[TicketAttachment]:
+    """Fallback when the issue representation carries no attachment list: the changelog
+    names each added file ("to" is its id), added by the event's actor at its time."""
+    found = []
+    for item in _as_list((payload.get("changelog") or {}).get("items")):
+        if not isinstance(item, dict) or item.get("field") != "Attachment":
+            continue
+        attachment_id, filename = item.get("to"), item.get("toString")
+        if not attachment_id or not filename:
+            continue  # a removal
+        found.append(
+            TicketAttachment(
+                id=str(attachment_id),
+                filename=str(filename)[:FILENAME_MAX_LENGTH],
+                url=attachment_url(str(attachment_id), str(filename)),
+                author_id=event["actor_id"],
+                author_name=event["actor_name"],
+                created_at=event["occurred_at"],
+            )
+        )
+    return found
 
 
 def _from_millis(value: object) -> datetime:

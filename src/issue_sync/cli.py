@@ -43,6 +43,7 @@ DEFAULT_HEADERS = {
     "description": "Description",
     "reporter": "Reporter",
     "contact": "Contact",
+    "attachments": "Attachments",
     "system_id": "System ID",
     "detail_url": "Detail link",
     "status": "Status",
@@ -119,7 +120,13 @@ def build_mapping(overrides: Sequence[str], sheet_headers: Sequence[str]) -> Doc
 
 
 async def _add_document(
-    settings: _DocumentSettings, name: str, spreadsheet: str, worksheet: str, maps: list[str]
+    settings: _DocumentSettings,
+    name: str,
+    spreadsheet: str,
+    worksheet: str,
+    maps: list[str],
+    *,
+    update: bool = False,
 ) -> str:
     spreadsheet_id = spreadsheet_id_from(spreadsheet)
     async with httpx.AsyncClient() as http:
@@ -139,25 +146,43 @@ async def _add_document(
             )
             if type_id is None:
                 raise CliError(f"document type {DOCUMENT_TYPE!r} is missing; run the migrations")
-            document = Document(
-                document_type_id=type_id,
-                name=name,
-                spreadsheet_id=spreadsheet_id,
-                worksheet_name=worksheet,
-                mapping=mapping.headers(),
+            existing = await session.scalar(
+                select(Document).where(
+                    Document.spreadsheet_id == spreadsheet_id,
+                    Document.worksheet_name == worksheet,
+                )
             )
-            session.add(document)
-            try:
-                await session.flush()
-            except IntegrityError:
-                raise CliError(
-                    f"worksheet {worksheet!r} of {spreadsheet_id} is already registered"
-                ) from None
-            document_id = document.id
+            if existing is not None:
+                if not update:
+                    raise CliError(
+                        f"worksheet {worksheet!r} of {spreadsheet_id} is already registered "
+                        f"(document {existing.id}); add --update to replace its name and mapping"
+                    )
+                existing.name = name
+                existing.mapping = mapping.headers()
+                document_id = existing.id
+                action = "Updated"
+            else:
+                action = "Registered"
+                document = Document(
+                    document_type_id=type_id,
+                    name=name,
+                    spreadsheet_id=spreadsheet_id,
+                    worksheet_name=worksheet,
+                    mapping=mapping.headers(),
+                )
+                session.add(document)
+                try:
+                    await session.flush()
+                except IntegrityError:
+                    raise CliError(
+                        f"worksheet {worksheet!r} of {spreadsheet_id} is already registered"
+                    ) from None
+                document_id = document.id
     finally:
         await engine.dispose()
 
-    lines = [f"Registered document {document_id}: {name}", "Mapping (field -> header):"]
+    lines = [f"{action} document {document_id}: {name}", "Mapping (field -> header):"]
     lines += [f"  {field:<12} -> {header}" for field, header in mapping.headers().items()]
     if layout.unmapped_headers:
         lines.append(f"Ignored columns: {', '.join(layout.unmapped_headers)}")
@@ -170,7 +195,14 @@ def add_document(args: argparse.Namespace) -> int:
         settings = _DocumentSettings()  # type: ignore[call-arg]  # from the environment
         print(
             asyncio.run(
-                _add_document(settings, args.name, args.spreadsheet, args.worksheet, args.map)
+                _add_document(
+                    settings,
+                    args.name,
+                    args.spreadsheet,
+                    args.worksheet,
+                    args.map,
+                    update=args.update,
+                )
             )
         )
     except ValidationError as exc:
@@ -259,6 +291,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="FIELD=HEADER",
         help="Override a header name; FIELD= drops an optional field. Repeatable. "
         f"Defaults: {', '.join(f'{k}={v}' for k, v in DEFAULT_HEADERS.items())}",
+    )
+    add.add_argument(
+        "--update",
+        action="store_true",
+        help="Replace the name and mapping of an already registered worksheet "
+        "(e.g. after adding an Attachments column); its records are kept",
     )
     evaluation = commands.add_parser(
         "eval-classifier", help="Run the AI triage against labelled cases and report accuracy"

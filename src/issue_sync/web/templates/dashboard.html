@@ -45,6 +45,12 @@
 {% set comparison_labels = {"differs": "Differs from AI", "rule": "Changed by a rule", "human": "Changed by a person", "agree": "Matches AI"} %}
 <form class="filters" method="get" action="/dashboard"
       hx-get="/dashboard" hx-target="#records" hx-push-url="true" hx-trigger="change, submit">
+  <label class="search">Search titles
+    <input type="search" name="q" value="{{ filters.search or '' }}" maxlength="200"
+           placeholder="e.g. export" autocomplete="off"
+           hx-get="/dashboard" hx-target="#records" hx-push-url="true"
+           hx-include="closest form" hx-trigger="input changed delay:400ms, search">
+  </label>
   <label>Status
     <select name="status">
       <option value="">All</option>
@@ -76,6 +82,9 @@
       <option value="">All</option>
       {% for v in comparison_filters %}<option value="{{ v }}"{% if filters.comparison == v %} selected{% endif %}>{{ comparison_labels[v] }}</option>{% endfor %}
     </select>
+  </label>
+  <label class="check" title="Push to Jira failed, or the row was deleted from the sheet">
+    <input type="checkbox" name="attention" value="1"{% if filters.attention %} checked{% endif %}> Needs attention
   </label>
   <noscript><button type="submit">Apply</button></noscript>
 </form>

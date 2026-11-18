@@ -367,3 +367,29 @@ One entry per trade-off: context, what was chosen, and why not the alternative.
 - **Detecting form rows from the data** (a "Timestamp" first column): a heading anyone can type, and localized.
 - **Debouncing in Apps Script** (e.g. waiting in the trigger): triggers cannot hold state reliably, and the poll would still take half rows.
 - **Re-triaging after edits**: the ticket and its Slack notification would already be out, possibly to the wrong team.
+
+## Milestone 9 — Attachments and dashboard finish
+
+### Files added in Jira are their own events
+- **Context:** A file can be added to a ticket without a comment, and the event log had no type for that.
+- **Chosen (migration 0004):** an `attachment` event type. One event per file, with name, browser link, size, type, who added it and when (`create_time` is the time in Jira). Kept apart from comments so "latest note" and comment history stay what they were.
+- **Not chosen:** Logging it as a `comment` without text. Every reader of comments (the sheet's latest note, the timeline, reconciliation's de-duplication) would have to skip the empty ones.
+
+### Attachments are keyed by id, read from three places
+- **Chosen:** Every `issue_updated` webhook carries the issue's full attachment list; each file is logged once by its Jira id, even from an event that is otherwise stale, because the list is not ordered by time and a late event can still name a file nobody logged. If an event has no list, the changelog's `Attachment` items name the added files. Reconciliation reads the `attachment` field too, so files from blocked or lost webhooks are recovered. Removals are not synced: the history is append-only, like comment edits.
+- Files added by the service account are skipped (the system uploads none today; if it ever does, they must not echo back).
+
+### Jira files are linked, not served
+- **Chosen:** The link is Jira's browser URL (`/secure/attachment/{id}/{name}`), which works for anyone signed in to Jira. The public detail page shows the name, size, who added it and when, and says that the file opens for Jira users.
+- **Not chosen:** Proxying downloads through this service. Anyone with a detail link could then download internal screenshots and logs, and the service would have to handle large files and content-type risks for no gain to the team, who can open Jira directly.
+
+### Sheet attachments are links in one column
+- **Chosen:** An optional mapped field `attachments` (one cell). It holds http(s) links separated by commas or whitespace, which is exactly what a Google Form file-upload question writes (Drive links). Anything else in the cell is ignored; at most 20 links. The links live in `raw` like the rest of the row, so there is no new column; they are recorded on the `created` event, changes appear in `source_modified` (before/after lists), and the ticket description lists them under "Attachments from the sheet".
+- Files are not copied: Drive keeps its own permissions, and the service account usually cannot read files a form collected. For the same reason the display name is "Google Drive file" (or the link's host), not the file name.
+- `add-document --update` replaces the mapping of a registered worksheet, so a column can be added later. Existing rows keep their hash; reconciliation then sees the ticket description lacks the links and pushes them.
+
+### Dashboard finish
+- Each row shows its attachment count (Jira files plus the sheet's current links).
+- A title search (case-insensitive substring; `%` and `_` are literal) updates the results as you type, through the same HTMX swap and pushed URL as the filters.
+- "Needs attention" lists records whose push failed or whose sheet row was deleted.
+- The detail page lists all attachments at the top, grouped by where they came from, as well as in the timeline.

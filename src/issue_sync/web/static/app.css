@@ -52,6 +52,8 @@ h2 { font-size: 1.05rem; margin: 0 0 0.75rem; }
   padding: 0.75rem 16px; border-bottom: 1px solid var(--border); background: var(--surface);
 }
 .brand { font-weight: 600; }
+.topbar .back { margin-left: auto; text-decoration: none; font-size: 0.9rem; }
+.topbar .back:hover { text-decoration: underline; }
 
 main { margin: 0 auto; padding: 1.5rem 16px; }
 main.narrow { max-width: 860px; }
@@ -83,6 +85,12 @@ tr.deleted td { opacity: 0.6; }
   font: inherit; color: var(--text); background: var(--surface);
   border: 1px solid var(--border); border-radius: 6px; padding: 0.35rem 0.5rem; min-width: 9rem;
 }
+.filters input[type="search"] {
+  font: inherit; color: var(--text); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 6px; padding: 0.35rem 0.5rem; min-width: 14rem;
+}
+.filters label.check { flex-direction: row; align-items: center; gap: 0.35rem; color: var(--text); font-size: 0.85rem; padding-bottom: 0.4rem; }
+.clip { white-space: nowrap; }
 .count { color: var(--muted); font-size: 0.85rem; margin: 0 0 0.5rem; }
 .htmx-request #records, #records.htmx-request { opacity: 0.6; transition: opacity 0.15s; }
 
@@ -129,11 +137,17 @@ ul.plain { padding-left: 1.1rem; }
 .event .when { color: var(--muted); font-size: 0.8rem; }
 .event .text { margin-top: 0.35rem; }
 .changes, .attachments { margin: 0.35rem 0 0; padding-left: 1.1rem; }
+.attachment-groups { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); }
+.attachment-groups h3 { font-size: 0.9rem; margin: 0 0 0.35rem; color: var(--muted); font-weight: 600; }
+ul.files { margin: 0; padding-left: 1.1rem; }
+ul.files li { overflow-wrap: anywhere; }
+.event-attachment::before { background: var(--accent); }
 .changes del { color: var(--muted); }
 .changes ins { text-decoration: none; }
 
 @media (max-width: 640px) {
   h1 { font-size: 1.25rem; }
   .filters label { flex: 1 1 45%; }
-  .filters select { min-width: 0; width: 100%; }
+  .filters select, .filters input[type="search"] { min-width: 0; width: 100%; }
+  .filters label.search { flex-basis: 100%; }
 }

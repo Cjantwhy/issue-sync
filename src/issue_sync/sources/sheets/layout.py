@@ -6,9 +6,11 @@ columns freely. `document.mapping` maps each predefined field to a header name.
 
 import hashlib
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
@@ -17,6 +19,12 @@ from issue_sync.sources.sheets.errors import SheetLayoutError
 
 # Owned by the sheet: synced sheet -> database -> ticket.
 SHEET_FIELDS = ("title", "description", "reporter", "contact")
+# Owned by the sheet too, but kept in `raw` only (no column of its own): links to files,
+# e.g. the Google Drive links a Google Form file-upload question writes.
+LINKS_FIELD = "attachments"
+MAX_LINKS = 20
+MAX_LINK_LENGTH = 2000
+_LINK_SEPARATORS = re.compile(r"[\s,]+")
 # Owned by this system: written to the sheet, never read back as content.
 SYSTEM_FIELDS = ("system_id", "detail_url", "status", "latest_note")
 
@@ -30,6 +38,7 @@ class DocumentMapping(BaseModel):
     description: str | None = None
     reporter: str | None = None
     contact: str | None = None
+    attachments: str | None = None  # links to files, one cell
     system_id: str
     detail_url: str
     # Written back from the ticket system in milestone 6.
@@ -69,6 +78,7 @@ class SheetRow:
     raw: dict[str, str]  # the whole row, keyed by header
     raw_hash: str  # SHA-256 of the row without system-owned columns
     has_content: bool  # any non-empty cell outside the system-owned columns
+    links: tuple[str, ...] = ()  # http(s) links in the attachments column
 
     def parsed_system_id(self) -> uuid.UUID | None:
         """The row's identity. Raises ValueError for a non-empty cell that is not a UUID."""
@@ -141,9 +151,37 @@ def parse_sheet(values: list[list[str]], mapping: DocumentMapping) -> SheetLayou
                 raw=raw,
                 raw_hash=content_hash(content),
                 has_content=any(content.values()),
+                links=parse_links(padded[columns[LINKS_FIELD]]) if LINKS_FIELD in columns else (),
             )
         )
     return SheetLayout(columns, unmapped, missing_optional, rows)
+
+
+def parse_links(cell: str | None) -> tuple[str, ...]:
+    """http(s) links in a cell, in order, without duplicates.
+
+    Separated by commas or whitespace: a Google Form file-upload answer is a
+    comma-separated list of Drive links; people typing links use new lines or spaces.
+    Anything else in the cell (notes, file names) is ignored.
+    """
+    links: list[str] = []
+    for token in _LINK_SEPARATORS.split(cell or ""):
+        if len(token) > MAX_LINK_LENGTH or token in links:
+            continue
+        parts = urlsplit(token)
+        if parts.scheme in ("http", "https") and parts.netloc:
+            links.append(token)
+            if len(links) == MAX_LINKS:
+                break
+    return tuple(links)
+
+
+def links_in_raw(raw: dict[str, Any] | None, header: str | None) -> tuple[str, ...]:
+    """The links of a stored row (`document_record.raw` is keyed by header)."""
+    if not raw or not header:
+        return ()
+    value = raw.get(header)
+    return parse_links(value if isinstance(value, str) else None)
 
 
 def content_hash(data: Any) -> str:

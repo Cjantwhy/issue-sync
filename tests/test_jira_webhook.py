@@ -164,10 +164,24 @@ async def test_comment_with_adf_body(backend: JiraBackend) -> None:
 
 
 def test_slim_payload_drops_bulky_fields() -> None:
-    slim = slim_payload(issue_updated())
-    assert set(slim["issue"]["fields"]) == {"project", "status", "priority", "assignee"}
-    assert "changelog" not in slim
-    assert len(json.dumps(slim)) < 1000
+    slim = slim_payload(issue_updated(attachment=[JIRA_FILE | {"thumbnail": "x" * 5000}]))
+    assert set(slim["issue"]["fields"]) == {
+        "project",
+        "status",
+        "priority",
+        "assignee",
+        "attachment",
+    }
+    assert slim["changelog"] == {"items": []}  # only attachment changes are kept
+    assert set(slim["issue"]["fields"]["attachment"][0]) == {
+        "id",
+        "filename",
+        "created",
+        "size",
+        "mimeType",
+        "author",
+    }
+    assert len(json.dumps(slim)) < 1500
 
 
 # ---------- endpoint ----------
@@ -342,3 +356,62 @@ async def test_concurrent_events_wait_for_one_status_load(
     for event in (first, second):
         assert event is not None and event.state is not None
         assert (event.state.status, event.state.external_status) == ("done", "Done")
+
+
+# ---------- attachments ----------
+
+JIRA_FILE = {
+    "id": "10200",
+    "filename": "error log #1.txt",
+    "author": {"accountId": "acc-human", "displayName": "Olga Ops"},
+    "created": "2026-11-17T10:05:00.000+0800",
+    "size": 2048,
+    "mimeType": "text/plain",
+    "content": "https://example.atlassian.net/rest/api/3/attachment/content/10200",
+}
+
+
+async def test_attachments_come_from_the_issue_fields(
+    backend: JiraBackend, statuses_route: respx.Route
+) -> None:
+    event = await backend.parse_webhook(
+        slim_payload(issue_updated(attachment=[JIRA_FILE, {"id": "bad"}]))
+    )
+
+    assert event is not None and len(event.attachments) == 1
+    file = event.attachments[0]
+    assert (file.id, file.filename, file.size, file.mime_type) == (
+        "10200",
+        "error log #1.txt",
+        2048,
+        "text/plain",
+    )
+    assert (file.author_id, file.author_name) == ("acc-human", "Olga Ops")
+    assert file.created_at == datetime(2026, 11, 17, 2, 5, tzinfo=UTC)
+    # A browser link (the API content URL needs a token), with the name escaped.
+    assert (
+        file.url == "https://example.atlassian.net/secure/attachment/10200/error%20log%20%231.txt"
+    )
+
+
+async def test_attachments_fall_back_to_the_changelog(
+    backend: JiraBackend, statuses_route: respx.Route
+) -> None:
+    payload = issue_updated()
+    payload["changelog"]["items"] += [
+        {"field": "Attachment", "to": "10201", "toString": "screen.png"},
+        {"field": "Attachment", "from": "10150", "fromString": "old.png"},  # a removal
+    ]
+
+    event = await backend.parse_webhook(slim_payload(payload))
+
+    assert event is not None
+    assert [(a.id, a.filename, a.author_name) for a in event.attachments] == [
+        ("10201", "screen.png", "Olga Ops")
+    ]
+    assert event.attachments[0].created_at == event.occurred_at
+
+
+async def test_issue_without_attachments(backend: JiraBackend, statuses_route: respx.Route) -> None:
+    event = await backend.parse_webhook(slim_payload(issue_updated()))
+    assert event is not None and event.attachments == []

@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -35,7 +35,7 @@ CONTENT_SECURITY_POLICY = (
     "connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
 )
 # Fields of a source_modified event that the public page may show (never `contact`).
-PUBLIC_CHANGE_FIELDS = ("title", "description", "reporter")
+PUBLIC_CHANGE_FIELDS = ("title", "description", "reporter", "attachments")
 
 
 def humanize(value: str | None) -> str:
@@ -103,6 +103,24 @@ def _render(
     return response
 
 
+# Dashboard query parameters a "back" link may carry; anything else is dropped.
+BACK_PARAMS = ("q", "attention", "status", "type", "urgency", "document", "comparison", "page")
+BACK_MAX_LENGTH = 1000
+
+
+def back_to_dashboard(back: str | None) -> str | None:
+    """The dashboard URL to return to, rebuilt from known filter parameters only.
+
+    Present only when the visitor came from the dashboard, so people opening a detail
+    link from the sheet or Slack never see a link to a page they cannot use. The URL is
+    always /dashboard on this site, whatever the parameter says.
+    """
+    if back is None or len(back) > BACK_MAX_LENGTH:
+        return None
+    kept = [(k, v) for k, v in parse_qsl(back) if k in BACK_PARAMS and v]
+    return "/dashboard" + ("?" + urlencode(kept) if kept else "")
+
+
 def _blank_to_none(value: str | None) -> str | None:
     return (value.strip() or None) if value else None
 
@@ -122,6 +140,8 @@ async def dashboard(
     urgency: str | None = None,
     document: str | None = None,
     comparison: str | None = None,
+    q: Annotated[str | None, Query(max_length=queries.SEARCH_MAX_LENGTH)] = None,
+    attention: str | None = None,
     page: Annotated[int, Query(ge=1, le=100_000)] = 1,
 ) -> HTMLResponse:
     document_id = _blank_to_none(document)
@@ -132,6 +152,8 @@ async def dashboard(
         urgency=_blank_to_none(urgency),
         document_id=int(document_id) if document_id and document_id.isdigit() else None,
         comparison=comparison if comparison in queries.COMPARISON_FILTERS else None,
+        search=_blank_to_none(q),
+        attention=attention == "1",
         page=page,
     )
     # htmx asks for the results only, except when restoring history after a cache miss.
@@ -145,6 +167,8 @@ async def dashboard(
             "filters": filters,
             "results": results,
             "page_url": lambda **kw: "/dashboard?" + urlencode(filters.query(**kw)),
+            # Detail links remember this view, so the detail page can link back to it.
+            "back_query": urlencode({"back": urlencode(filters.query())}),
         }
         if not partial:
             context["options"] = await queries.filter_options(session)
@@ -157,7 +181,11 @@ async def dashboard(
 
 @router.get("/r/{system_id}", response_class=HTMLResponse, include_in_schema=False)
 async def record_page(
-    request: Request, system_id: str, sessionmaker: Sessionmaker, jira: Jira
+    request: Request,
+    system_id: str,
+    sessionmaker: Sessionmaker,
+    jira: Jira,
+    back: str | None = None,
 ) -> HTMLResponse:
     try:
         key = uuid.UUID(system_id)
@@ -173,6 +201,11 @@ async def record_page(
     return _render(
         request,
         "detail.html",
-        {"d": detail, "r": detail.row, "public_change_fields": PUBLIC_CHANGE_FIELDS},
+        {
+            "d": detail,
+            "r": detail.row,
+            "public_change_fields": PUBLIC_CHANGE_FIELDS,
+            "back_url": back_to_dashboard(back),
+        },
         public=True,
     )

@@ -35,6 +35,7 @@ from issue_sync.sync.reconcile import Reconciler
 from issue_sync.sync.settle import NewRowPolicy
 from issue_sync.sync.ticket_events import apply_ticket_event
 from issue_sync.tickets.base import (
+    TicketAttachment,
     TicketBackendUnavailable,
     TicketComment,
     TicketContent,
@@ -1515,3 +1516,143 @@ async def test_note_is_not_written_into_a_row_that_moved(
 
     assert report is not None and report.cells_written == 0
     assert sheet.cell(2, STATUS_COL) == ""
+
+
+# ---------- attachments ----------
+
+
+def _file(file_id: str = "a1", author: str = "acc-human", hours: int = 0) -> TicketAttachment:
+    return TicketAttachment(
+        id=file_id,
+        filename=f"{file_id}.png",
+        url=f"https://jira/secure/attachment/{file_id}/{file_id}.png",
+        author_id=author,
+        author_name="Olga Ops",
+        created_at=datetime(2026, 11, 17, 10, 0, tzinfo=UTC) + timedelta(hours=hours),
+        size=1024,
+        mime_type="image/png",
+    )
+
+
+async def _attachment_events(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> list[DocumentRecordHistory]:
+    async with sessionmaker() as session:
+        return list(
+            await session.scalars(
+                select(DocumentRecordHistory)
+                .where(DocumentRecordHistory.event_type == "attachment")
+                .order_by(DocumentRecordHistory.create_time)
+            )
+        )
+
+
+async def test_ticket_attachments_are_logged_once(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    await _sheet_with_ticket(sessionmaker)
+    first = _event(seconds=60).model_copy(update={"attachments": [_file("a1")]})
+    again = _event(seconds=120).model_copy(
+        update={"attachments": [_file("a1"), _file("a2", hours=1)]}
+    )
+    # Older than the watermark, but it names a file nobody has logged yet.
+    late = _event(seconds=90).model_copy(update={"attachments": [_file("a3", hours=2)]})
+
+    results = [await apply_ticket_event(sessionmaker, e) for e in (first, again, late)]
+    repeat = await apply_ticket_event(sessionmaker, late)
+
+    assert [r.outcome for r in results] == ["updated", "updated", "updated"]
+    assert repeat.outcome == "stale"
+    assert not results[2].sheet_changed  # attachments are not shown in the sheet
+    events = await _attachment_events(sessionmaker)
+    assert [e.detail["jira_attachment_id"] for e in events] == ["a1", "a2", "a3"]
+    first_event = events[0]
+    assert first_event.created_by == "Olga Ops"
+    assert first_event.create_time == datetime(2026, 11, 17, 10, 0, tzinfo=UTC)
+    assert first_event.attachments == [
+        {
+            "name": "a1.png",
+            "url": "https://jira/secure/attachment/a1/a1.png",
+            "source": "jira",
+            "size": 1024,
+            "mime_type": "image/png",
+        }
+    ]
+
+
+async def test_reconciliation_recovers_missed_attachments(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    _, sheet, tickets, _ = await _tracked(sessionmaker)
+    tickets.jira_side["OPS-1"] = {"attachments": [_file("a1"), _file("bot", author="acc-bot")]}
+    reconciler = _reconciler(sessionmaker, tickets, sheet)
+
+    first = await reconciler.run()
+    second = await reconciler.run()
+
+    assert (first.attachments_added, second.attachments_added) == (1, 0)
+    assert [e.detail["jira_attachment_id"] for e in await _attachment_events(sessionmaker)] == [
+        "a1"
+    ]
+
+
+MAPPING_FILES = {**MAPPING, "attachments": "Files"}
+HEADER_FILES = [*HEADER, "Files"]
+FILES_COL = 6
+DRIVE_A = "https://drive.google.com/open?id=AAA"
+DRIVE_B = "https://drive.google.com/open?id=BBB"
+
+
+async def test_sheet_links_are_recorded_and_pushed(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    document_id = await _add_document(sessionmaker, worksheet="Files", mapping=MAPPING_FILES)
+    # As a Google Form file-upload answer writes it, plus a note that is not a link.
+    row = ["Export fails", "Details", "Ann", "", "", "", f"{DRIVE_A}, {DRIVE_B}, see above"]
+    sheet = FakeSheet([HEADER_FILES, row])
+    sync = _sync(sessionmaker, sheet)
+    await sync.sync_document(document_id)
+    record_id = (await _records(sessionmaker))[0].id
+    tickets = FakeTickets()
+    await push_record(sessionmaker, tickets, record_id, BASE_URL)
+
+    async with sessionmaker() as session:
+        created = await session.scalar(
+            select(DocumentRecordHistory).where(DocumentRecordHistory.event_type == "created")
+        )
+    assert created is not None and created.attachments == [
+        {"name": "Google Drive file", "url": DRIVE_A, "source": "sheet"},
+        {"name": "Google Drive file", "url": DRIVE_B, "source": "sheet"},
+    ]
+    assert tickets.created_drafts[0].links == (DRIVE_A, DRIVE_B)
+
+    # One link removed: a change like any other sheet edit, pushed to the ticket.
+    sheet.grid[1][FILES_COL] = DRIVE_B
+    report = await sync.sync_document(document_id)
+    assert report is not None and report.modified == 1
+    async with sessionmaker() as session:
+        modified = await session.scalar(
+            select(DocumentRecordHistory).where(
+                DocumentRecordHistory.event_type == "source_modified"
+            )
+        )
+    assert modified is not None
+    assert modified.detail["changes"] == {
+        "attachments": {"from": [DRIVE_A, DRIVE_B], "to": [DRIVE_B]}
+    }
+    assert modified.attachments == [
+        {"name": "Google Drive file", "url": DRIVE_B, "source": "sheet"}
+    ]
+    result = await push_record(sessionmaker, tickets, record_id, BASE_URL)
+    assert result.outcome == "updated"
+    assert tickets.tickets["OPS-1"]["content"].links == (DRIVE_B,)
+
+
+async def test_links_column_is_optional(
+    sessionmaker: async_sessionmaker[AsyncSession], document_id: int
+) -> None:
+    # The default mapping has no attachments column: nothing changes for such sheets.
+    record_id = await _one_record(sessionmaker, document_id)
+    tickets = FakeTickets()
+    await push_record(sessionmaker, tickets, record_id, BASE_URL)
+    assert tickets.created_drafts[0].links == ()

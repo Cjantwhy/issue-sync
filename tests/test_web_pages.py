@@ -43,6 +43,7 @@ T0 = datetime(2026, 11, 17, 9, 0, tzinfo=UTC)
 USER, PASSWORD = "admin", "correct horse battery"
 CONTACT = "alice.private@example.com"
 XSS_TITLE = "<script>alert(1)</script> Export"
+DRIVE = "https://drive.google.com/open?id=AAA"
 
 
 # ---------- fixtures ----------
@@ -94,7 +95,7 @@ class Seeder:
             name="Requests",
             spreadsheet_id="1AbC",
             worksheet_name="Requests",
-            mapping={"title": "Title"},
+            mapping={"title": "Title", "attachments": "Files"},
         )
         self.session.add(document)
         await self.session.flush()
@@ -218,6 +219,7 @@ async def seeded(sessionmaker: async_sessionmaker[AsyncSession]) -> dict[str, Do
             reporter="Alice",
             contact=CONTACT,
             source_deleted_at=T0 + timedelta(days=1),
+            raw={"Title": XSS_TITLE, "Files": f"{DRIVE}, javascript:alert(1)"},
         )
         session.add_all(
             [
@@ -236,6 +238,7 @@ async def seeded(sessionmaker: async_sessionmaker[AsyncSession]) -> dict[str, Do
                         "changes": {
                             "title": {"from": "Export", "to": XSS_TITLE},
                             "contact": {"from": "old@example.com", "to": CONTACT},
+                            "attachments": {"from": [], "to": [DRIVE]},
                         },
                     },
                     create_time=T0 + timedelta(minutes=5),
@@ -258,6 +261,22 @@ async def seeded(sessionmaker: async_sessionmaker[AsyncSession]) -> dict[str, Do
                     ],
                     created_by="Olga Ops",
                     create_time=T0 + timedelta(minutes=20),
+                ),
+                DocumentRecordHistory(
+                    document_record_id=public.id,
+                    event_type="attachment",
+                    attachments=[
+                        {
+                            "name": "screenshot.png",
+                            "url": "https://example.atlassian.net/secure/attachment/1/screenshot.png",
+                            "source": "jira",
+                            "size": 2048,
+                            "mime_type": "image/png",
+                        }
+                    ],
+                    detail={"jira_attachment_id": "1"},
+                    created_by="Olga Ops",
+                    create_time=T0 + timedelta(minutes=30),
                 ),
                 DocumentRecordHistory(
                     document_record_id=public.id,
@@ -457,7 +476,7 @@ async def test_dashboard_full_page(
     html = response.text
     assert "<html" in html and 'name="comparison"' in html
     assert "model-a" in html and "6 records" in html
-    assert f'href="/r/{seeded["agree"].system_id}"' in html
+    assert f'href="/r/{seeded["agree"].system_id}?back="' in html
     assert "https://example.atlassian.net/browse/OPS-1" in html
     assert "<script>alert(1)</script>" not in html
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
@@ -562,3 +581,121 @@ async def test_unknown_or_malformed_id_is_the_same_404(
 async def test_static_files_are_served(client: httpx.AsyncClient) -> None:
     assert (await client.get("/static/htmx-2.0.4.min.js")).status_code == 200
     assert (await client.get("/static/app.css")).status_code == 200
+
+
+# ---------- attachments, search, needs attention ----------
+
+
+async def test_attachment_count_combines_sheet_links_and_jira_files(
+    sessionmaker: async_sessionmaker[AsyncSession], seeded: dict[str, DocumentRecord]
+) -> None:
+    rows = await _list(sessionmaker)
+    public = rows[XSS_TITLE]
+    # One Drive link (the javascript: entry is not a link) and one file added in Jira.
+    assert (public.sheet_links, public.jira_attachments) == ((DRIVE,), 1)
+    assert public.attachment_count == 2
+    assert rows["Agree"].attachment_count == 0
+
+
+async def test_dashboard_shows_the_attachment_count(
+    client: httpx.AsyncClient, seeded: dict[str, DocumentRecord]
+) -> None:
+    html = (await client.get("/dashboard", headers=_auth())).text
+    assert "📎 2" in html and 'title="2 attachments"' in html
+
+
+@pytest.mark.parametrize(
+    ("search", "titles"),
+    [
+        ("export", {XSS_TITLE}),
+        ("AGREE", {"Agree"}),
+        ("e", {"Agree", "Rule", "Legacy", "Not created yet", XSS_TITLE}),
+        ("%", set()),  # a literal percent sign, not a wildcard
+        ("_", set()),
+    ],
+)
+async def test_title_search(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    seeded: dict[str, DocumentRecord],
+    search: str,
+    titles: set[str],
+) -> None:
+    assert set(await _list(sessionmaker, search=search)) == titles
+
+
+async def test_needs_attention(
+    sessionmaker: async_sessionmaker[AsyncSession], seeded: dict[str, DocumentRecord]
+) -> None:
+    async with sessionmaker() as session, session.begin():
+        await session.execute(
+            text("UPDATE ticket_sync SET push_status = 'failed' WHERE document_record_id = :id"),
+            {"id": seeded["legacy"].id},
+        )
+    assert set(await _list(sessionmaker, attention=True)) == {"Legacy", XSS_TITLE}
+
+
+async def test_search_and_attention_through_the_page(
+    client: httpx.AsyncClient, seeded: dict[str, DocumentRecord]
+) -> None:
+    response = await client.get(
+        "/dashboard",
+        params={"q": "export", "attention": "1", "page": "1"},
+        headers={**_auth(), "HX-Request": "true"},
+    )
+    assert "1 record" in response.text
+    full = (await client.get("/dashboard", params={"q": "export"}, headers=_auth())).text
+    assert 'value="export"' in full
+    too_long = await client.get("/dashboard", params={"q": "x" * 201}, headers=_auth())
+    assert too_long.status_code == 422
+
+
+async def test_detail_page_lists_attachments(
+    client: httpx.AsyncClient, seeded: dict[str, DocumentRecord]
+) -> None:
+    html = (await client.get(f"/r/{seeded['public'].system_id}")).text
+
+    assert "From the sheet" in html and f'href="{DRIVE}"' in html
+    assert "Added in Jira" in html and "screenshot.png" in html and "2.0 kB" in html
+    assert "File added in Jira" in html
+    assert "0 links → 1 link" in html
+    assert "javascript:" not in html
+
+
+# ---------- back to the dashboard ----------
+
+
+async def test_detail_links_remember_the_dashboard_view(
+    client: httpx.AsyncClient, seeded: dict[str, DocumentRecord]
+) -> None:
+    html = (
+        await client.get("/dashboard", params={"q": "agree", "status": "open"}, headers=_auth())
+    ).text
+    # The filters, URL-encoded twice: once as the dashboard query, once as a parameter.
+    assert f'href="/r/{seeded["agree"].system_id}?back=q%3Dagree%26status%3Dopen"' in html
+
+    detail = (
+        await client.get(f"/r/{seeded['agree'].system_id}", params={"back": "q=agree&status=open"})
+    ).text
+    assert 'href="/dashboard?q=agree&amp;status=open"' in detail
+    assert "Back to dashboard" in detail
+
+
+async def test_no_back_link_without_coming_from_the_dashboard(
+    client: httpx.AsyncClient, seeded: dict[str, DocumentRecord]
+) -> None:
+    html = (await client.get(f"/r/{seeded['agree'].system_id}")).text
+    assert "Back to dashboard" not in html and "/dashboard" not in html
+
+
+@pytest.mark.parametrize(
+    ("back", "expected"),
+    [
+        ("", "/dashboard"),
+        ("q=export&page=2", "/dashboard?q=export&page=2"),
+        ("next=https://evil.example.com&status=done", "/dashboard?status=done"),
+        ("//evil.example.com", "/dashboard"),
+        ("q=" + "x" * 2000, None),
+    ],
+)
+def test_back_link_is_always_the_dashboard(back: str, expected: str | None) -> None:
+    assert routes.back_to_dashboard(back) == expected
