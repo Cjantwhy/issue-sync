@@ -228,3 +228,6 @@ secrets/
 
 # Browser automation output (local QA screenshots)
 .playwright-mcp/
+
+# Local working notes for the AI assistant (not part of the project)
+CLAUDE.md
