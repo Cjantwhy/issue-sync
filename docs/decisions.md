@@ -393,3 +393,31 @@ One entry per trade-off: context, what was chosen, and why not the alternative.
 - A title search (case-insensitive substring; `%` and `_` are literal) updates the results as you type, through the same HTMX swap and pushed URL as the filters.
 - "Needs attention" lists records whose push failed or whose sheet row was deleted.
 - The detail page lists all attachments at the top, grouped by where they came from, as well as in the timeline.
+
+## Milestone 10 — Deployment
+
+### One Compose project, a production overlay
+- **Chosen:** `docker-compose.yml` stays the local stack (database and Redis ports published for tests and tools). `docker-compose.prod.yml` is layered on top: no published database or Redis ports (`!reset`), the api bound to 127.0.0.1, a `cloudflared` connector, log rotation and restart policies everywhere. One command starts either.
+- **Not chosen:** Two independent Compose files: they drift. A `docker-compose.override.yml` for development: it is loaded automatically, so forgetting `-f` in production would silently publish the database port.
+- Image versions are pinned (Postgres 16.14, Redis 7.4.10, cloudflared 2026.10.1), so a restart never brings an unplanned upgrade.
+
+### A public entry point: tunnel or reverse proxy
+- **Context:** Apps Script and Jira call the webhooks from their own servers, so production needs a public HTTPS address; trying the system does not (polling and reconciliation cover both directions, only more slowly).
+- **Chosen:** `cloudflared` is behind the Compose profile `tunnel`. Without the profile, the same overlay serves a host-side reverse proxy on 127.0.0.1:8000; `docs/deployment.md` gives a minimal Caddyfile with the same path allow-list as the tunnel's routes. `TUNNEL_TOKEN` uses `${...:-}`, not `${...:?}`, because Compose resolves variables before it applies profiles: a required variable would be demanded from deployments that do not use the tunnel.
+- The tunnel stays the recommended option even on a server with a public IP: no inbound port, origin IP hidden, TLS and WAF included. A proxy is the choice when the domain is not on Cloudflare.
+
+### The tunnel runs in Compose, routes stay in Cloudflare
+- **Chosen:** A remotely managed tunnel: the container only needs `TUNNEL_TOKEN`; hostnames, path routes (`/webhooks/(sheets|jira)`, `/r/`, `/static/`) and the WAF rule live in the Cloudflare dashboard and are documented in `docs/deployment.md`, including the two mistakes made while building this (an inverted method rule, and Bot Fight Mode blocking Jira).
+- **Not chosen:** A locally managed tunnel with a `config.yml` and credentials file in the repo: one more secret file to mount, and the routes would be split between the repo and the dashboard anyway (WAF and bot settings cannot live in the file).
+- The token is in `.env`, which every app container also reads. That is the same trust boundary as the database password already there; separate env files per service were not worth the extra setup.
+
+### CI checks what a reviewer would
+- **Chosen:** GitHub Actions runs ruff (lint and format), the full test suite against a real PostgreSQL 16 service (integration tests included), builds the image and validates both Compose files. External services stay mocked, as everywhere in the tests.
+
+### Screenshots from fictional data
+- **Chosen:** README screenshots come from a separate, throwaway database filled with invented requests and people, served by a local api with the example configs. Real tickets and names never appear in the portfolio.
+- The attachment indicator became an inline SVG: the emoji rendered differently on each system (and not at all without an emoji font).
+
+### Verified live through the production stack
+- With `docker-compose.prod.yml` and the tunnel in Compose: Jira webhooks reach the app (an unsigned request gets the app's 401), detail pages and static files load from outside, and `/dashboard` and `/health` answer 404 at Cloudflare.
+- Apps Script: a title typed by hand reached the app through the tunnel and got "Waiting for: Description" within a second; after the description was filled in, the scheduled re-check ran exactly 120 s later and created the ticket, with one job despite several edits. A Google Form submission (`source: form`, row 2) created its ticket and Slack message within 10 seconds.

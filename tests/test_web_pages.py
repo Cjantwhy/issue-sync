@@ -601,7 +601,7 @@ async def test_dashboard_shows_the_attachment_count(
     client: httpx.AsyncClient, seeded: dict[str, DocumentRecord]
 ) -> None:
     html = (await client.get("/dashboard", headers=_auth())).text
-    assert "📎 2" in html and 'title="2 attachments"' in html
+    assert 'title="2 attachments"' in html and '<svg class="icon"' in html
 
 
 @pytest.mark.parametrize(

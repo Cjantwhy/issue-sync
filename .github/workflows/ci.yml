@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16.14-alpine
+        env:
+          POSTGRES_USER: issue_sync
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U issue_sync"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      # Integration tests create and drop a throwaway database per module.
+      TEST_DATABASE_URL: postgresql+asyncpg://issue_sync:ci-only-password@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+        with:
+          version: "0.10.6"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --locked
+      - name: Lint
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+      - name: Test (unit and integration)
+        run: uv run pytest -q
+
+  image:
+    name: Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build
+        run: docker build -t issue-sync:ci .
+      - name: Validate Compose files
+        run: |
+          cp .env.example .env
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile tunnel config --quiet

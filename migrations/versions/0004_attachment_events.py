@@ -16,9 +16,7 @@ depends_on: str | Sequence[str] | None = None
 
 CONSTRAINT = "document_record_history_event_type_check"
 BEFORE = "'created', 'status_changed', 'source_modified', 'comment', 'source_deleted'"
-AFTER = (
-    "'created', 'status_changed', 'source_modified', 'comment', 'attachment', 'source_deleted'"
-)
+AFTER = "'created', 'status_changed', 'source_modified', 'comment', 'attachment', 'source_deleted'"
 
 
 def _replace_check(values: str) -> None:

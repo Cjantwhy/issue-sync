@@ -1,0 +1,61 @@
+# Production overlay. Start with one of:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile tunnel up -d --build --wait
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build --wait
+# The first runs a Cloudflare Tunnel connector; the second expects a reverse proxy on the
+# host in front of 127.0.0.1:8000. docs/deployment.md covers both.
+#
+# On top of docker-compose.yml:
+# - Postgres and Redis publish no ports; the api listens on 127.0.0.1 only. The internet
+#   reaches it through the tunnel or the proxy, which expose just the webhooks, the
+#   detail pages and their static files.
+# - Logs are rotated, so a long-running host does not fill its disk.
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  postgres:
+    <<: *logging
+    ports: !reset []
+    restart: unless-stopped
+
+  redis:
+    <<: *logging
+    ports: !reset []
+    restart: unless-stopped
+
+  migrate:
+    <<: *logging
+
+  api:
+    <<: *logging
+    # Loopback only: for the dashboard over SSH (ssh -L 8000:127.0.0.1:8000 host)
+    # and for health checks on the host. Public traffic arrives through the tunnel.
+    ports: !override
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
+
+  worker:
+    <<: *logging
+
+  cloudflared:
+    <<: *logging
+    # Only with --profile tunnel. Without it, put a reverse proxy in front of
+    # 127.0.0.1:8000 instead (docs/deployment.md, "Option B").
+    profiles: ["tunnel"]
+    image: cloudflare/cloudflared:2026.10.1
+    # Remotely managed tunnel: the public hostname and its routes are configured in the
+    # Cloudflare dashboard and point at http://api:8000 inside this network.
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      # From .env (Zero Trust > Networks > Tunnels). Optional unless the profile is on:
+      # Compose resolves variables before it applies profiles, so ":?" would demand it
+      # from every deployment.
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
